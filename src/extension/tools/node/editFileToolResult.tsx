@@ -8,6 +8,7 @@ import type * as vscode from 'vscode';
 import { ConfigKey, IConfigurationService } from '../../../platform/configuration/common/configurationService';
 import { modelNeedsStrongReplaceStringHint } from '../../../platform/endpoint/common/chatModelCapabilities';
 import { IEndpointProvider } from '../../../platform/endpoint/common/endpointProvider';
+import { IFileSystemService } from '../../../platform/filesystem/common/fileSystemService';
 import { ILanguageDiagnosticsService } from '../../../platform/languages/common/languageDiagnosticsService';
 import { IPromptPathRepresentationService } from '../../../platform/prompts/common/promptPathRepresentationService';
 import { ISimulationTestContext } from '../../../platform/simulationTestContext/common/simulationTestContext';
@@ -18,6 +19,7 @@ import { timeout } from '../../../util/vs/base/common/async';
 import { URI } from '../../../util/vs/base/common/uri';
 import { Diagnostic, DiagnosticSeverity } from '../../../vscodeTypes';
 import { ToolName } from '../common/toolNames';
+import { AgentSessionManager, IAgentSessionManager } from './agentSessionManager';
 import { DiagnosticToolOutput } from './getErrorsTool';
 
 export interface IEditedFile {
@@ -38,6 +40,8 @@ export interface IEditFileResultProps extends BasePromptElementProps {
 }
 
 export class EditFileResult extends PromptElement<IEditFileResultProps> {
+	private sessionManager: IAgentSessionManager;
+
 	constructor(
 		props: PromptElementProps<IEditFileResultProps>,
 		@IConfigurationService private readonly configurationService: IConfigurationService,
@@ -47,8 +51,15 @@ export class EditFileResult extends PromptElement<IEditFileResultProps> {
 		@IWorkspaceService protected readonly workspaceService: IWorkspaceService,
 		@ITelemetryService private readonly telemetryService: ITelemetryService,
 		@IEndpointProvider private readonly endpointProvider: IEndpointProvider,
+		@IFileSystemService private readonly fileSystemService: IFileSystemService,
 	) {
 		super(props);
+		this.sessionManager = new AgentSessionManager(
+			props.instantiationService,
+			this.workspaceService,
+			this.fileSystemService,
+			this.telemetryService
+		);
 	}
 
 	override async render(state: void, sizing: PromptSizing) {
@@ -58,10 +69,35 @@ export class EditFileResult extends PromptElement<IEditFileResultProps> {
 		let totalNewDiagnostics = 0;
 		let filesWithNewDiagnostics = 0;
 
+		// 跟踪文件变化
 		for (const file of this.props.files) {
 			if (file.error) {
 				editingErrors.push(file.error);
 				continue;
+			}
+
+			// 获取文件修改前后的内容用于计算行数变化
+			let oldContent: string | undefined;
+			let newContent: string | undefined;
+
+			try {
+				if (file.operation === 'update' || file.operation === 'delete') {
+					// 尝试获取修改前的内容
+					const oldSnapshot = await this.workspaceService.openTextDocumentAndSnapshot(file.uri);
+					oldContent = oldSnapshot.getText();
+				}
+
+				if (file.operation === 'add' || file.operation === 'update') {
+					// 获取修改后的内容
+					const newSnapshot = await this.workspaceService.openTextDocumentAndSnapshot(file.uri);
+					newContent = newSnapshot.getText();
+				}
+
+				// 跟踪文件变化
+				const tracker = this.sessionManager.getCurrentSessionTracker();
+				await tracker.trackFileChange(file.uri, file.operation, oldContent, newContent);
+			} catch (error) {
+				console.warn(`Failed to track file change for ${file.uri.fsPath}:`, error);
 			}
 
 			const diagnostics = !this.testContext.isInSimulationTests && this.configurationService.getConfig(ConfigKey.AutoFixDiagnostics) && !(file.isNotebook)
@@ -91,6 +127,16 @@ export class EditFileResult extends PromptElement<IEditFileResultProps> {
 
 		if (this.props.toolName && this.props.requestId) {
 			await this.sendEditFileResultTelemetry(totalNewDiagnostics, filesWithNewDiagnostics);
+		}
+
+		// 如果有文件被修改，打印统计信息并保存JSON文件
+		if (successfullyEditedFiles.length > 0) {
+			// 打印统计信息到OUTPUT
+			const tracker = this.sessionManager.getCurrentSessionTracker();
+			tracker.printSessionStats();
+
+			// 保存统计信息到JSON文件
+			await tracker.saveSessionStats();
 		}
 
 		return (

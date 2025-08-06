@@ -11,6 +11,7 @@ import { ConfigKey, IConfigurationService } from '../../../../platform/configura
 import { modelNeedsStrongReplaceStringHint } from '../../../../platform/endpoint/common/chatModelCapabilities';
 import { CacheType } from '../../../../platform/endpoint/common/endpointTypes';
 import { IEnvService, OperatingSystem } from '../../../../platform/env/common/envService';
+import { IFileSystemService } from '../../../../platform/filesystem/common/fileSystemService';
 import { getGitHubRepoInfoFromContext, IGitService } from '../../../../platform/git/common/gitService';
 import { ILogService } from '../../../../platform/log/common/logService';
 import { IChatEndpoint } from '../../../../platform/networking/common/networking';
@@ -18,11 +19,12 @@ import { IAlternativeNotebookContentService } from '../../../../platform/noteboo
 import { IPromptPathRepresentationService } from '../../../../platform/prompts/common/promptPathRepresentationService';
 import { ITabsAndEditorsService } from '../../../../platform/tabs/common/tabsAndEditorsService';
 import { ITasksService } from '../../../../platform/tasks/common/tasksService';
+import { ITelemetryService } from '../../../../platform/telemetry/common/telemetry';
 import { IWorkspaceService } from '../../../../platform/workspace/common/workspaceService';
 import { coalesce } from '../../../../util/vs/base/common/arrays';
 import { basename } from '../../../../util/vs/base/common/path';
 import { IInstantiationService } from '../../../../util/vs/platform/instantiation/common/instantiation';
-import { ChatRequestEditedFileEventKind, Position, Range } from '../../../../vscodeTypes';
+import { ChatRequestEditedFileEventKind } from '../../../../vscodeTypes';
 import { GenericBasePromptElementProps } from '../../../context/node/resolvers/genericPanelIntentInvocation';
 import { GitHubPullRequestProviders } from '../../../conversation/node/githubPullRequestProviders';
 import { ChatVariablesCollection } from '../../../prompt/common/chatVariablesCollection';
@@ -30,6 +32,7 @@ import { GlobalContextMessageMetadata, RenderedUserMessageMetadata, Turn } from 
 import { InternalToolReference } from '../../../prompt/common/intents';
 import { IPromptVariablesService } from '../../../prompt/node/promptVariablesService';
 import { ToolName } from '../../../tools/common/toolNames';
+import { AgentSessionManager, IAgentSessionManager } from '../../../tools/node/agentSessionManager';
 import { CopilotIdentityRules } from '../base/copilotIdentity';
 import { IPromptEndpoint, renderPromptElement } from '../base/promptRenderer';
 import { SafetyRules } from '../base/safetyRules';
@@ -71,16 +74,33 @@ const MAX_TOOL_RESPONSE_PCT = 0.5;
  * The agent mode prompt, rendered on each request
  */
 export class AgentPrompt extends PromptElement<AgentPromptProps> {
+	private sessionManager: IAgentSessionManager;
+
 	constructor(
 		props: AgentPromptProps,
 		@IConfigurationService private readonly configurationService: IConfigurationService,
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
 		@IPromptEndpoint private readonly promptEndpoint: IPromptEndpoint,
+		@IWorkspaceService private readonly workspaceService: IWorkspaceService,
+		@IFileSystemService private readonly fileSystemService: IFileSystemService,
+		@ITelemetryService private readonly telemetryService: ITelemetryService,
 	) {
 		super(props);
+		this.sessionManager = new AgentSessionManager(
+			this.instantiationService,
+			this.workspaceService,
+			this.fileSystemService,
+			this.telemetryService
+		);
 	}
 
 	async render(state: void, sizing: PromptSizing) {
+		// 启动agent会话跟踪
+		this.sessionManager.setAgentMode(true);
+		if (!this.sessionManager.getCurrentSessionStats()) {
+			this.sessionManager.startNewSession(this.props.promptContext.requestId);
+		}
+
 		const instructions = this.configurationService.getConfig(ConfigKey.Internal.SweBenchAgentPrompt) ?
 			<SweBenchAgentPrompt availableTools={this.props.promptContext.tools?.availableTools} modelFamily={this.props.endpoint.family} codesearchMode={undefined} /> :
 			<DefaultAgentPrompt
