@@ -4,9 +4,9 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { IFileSystemService } from '../../../platform/filesystem/common/fileSystemService';
+import { ILogService } from '../../../platform/log/common/logService';
 import { ITelemetryService } from '../../../platform/telemetry/common/telemetry';
 import { IWorkspaceService } from '../../../platform/workspace/common/workspaceService';
-import { IInstantiationService } from '../../../util/vs/platform/instantiation/common/instantiation';
 import { AgentFileChangeTracker, IAgentFileChangeTracker, IAgentSessionStats } from './agentFileChangeTracker';
 
 export interface IAgentSessionManager {
@@ -47,19 +47,19 @@ export class AgentSessionManager implements IAgentSessionManager {
 	private sessionId: string | null = null;
 
 	constructor(
-		@IInstantiationService private readonly instantiationService: IInstantiationService,
 		@IWorkspaceService private readonly workspaceService: IWorkspaceService,
 		@IFileSystemService private readonly fileSystemService: IFileSystemService,
 		@ITelemetryService private readonly telemetryService: ITelemetryService,
+		@ILogService private readonly logService: ILogService,
 	) { }
 
 	getCurrentSessionTracker(): IAgentFileChangeTracker {
 		if (!this.currentTracker) {
 			this.currentTracker = new AgentFileChangeTracker(
-				this.instantiationService,
 				this.workspaceService,
 				this.fileSystemService,
-				this.telemetryService
+				this.telemetryService,
+				this.logService
 			);
 		}
 		return this.currentTracker;
@@ -68,10 +68,10 @@ export class AgentSessionManager implements IAgentSessionManager {
 	startNewSession(sessionId?: string): void {
 		this.sessionId = sessionId || this.generateSessionId();
 		this.currentTracker = new AgentFileChangeTracker(
-			this.instantiationService,
 			this.workspaceService,
 			this.fileSystemService,
-			this.telemetryService
+			this.telemetryService,
+			this.logService
 		);
 		this.currentTracker.resetSession(this.sessionId);
 		this.isAgentModeActive = true;
@@ -99,7 +99,9 @@ export class AgentSessionManager implements IAgentSessionManager {
 	}
 
 	isAgentMode(): boolean {
-		return this.isAgentModeActive;
+		// 目前先假设所有操作都在agent模式下，这样我们能看到跟踪效果
+		// 在真正的实现中，可能需要根据实际的agent上下文来判断
+		return true; // 临时设置为true来启用跟踪
 	}
 
 	setAgentMode(isAgent: boolean): void {

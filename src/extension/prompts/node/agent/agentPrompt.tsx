@@ -24,7 +24,7 @@ import { IWorkspaceService } from '../../../../platform/workspace/common/workspa
 import { coalesce } from '../../../../util/vs/base/common/arrays';
 import { basename } from '../../../../util/vs/base/common/path';
 import { IInstantiationService } from '../../../../util/vs/platform/instantiation/common/instantiation';
-import { ChatRequestEditedFileEventKind } from '../../../../vscodeTypes';
+import { ChatRequestEditedFileEventKind, Position, Range } from '../../../../vscodeTypes';
 import { GenericBasePromptElementProps } from '../../../context/node/resolvers/genericPanelIntentInvocation';
 import { GitHubPullRequestProviders } from '../../../conversation/node/githubPullRequestProviders';
 import { ChatVariablesCollection } from '../../../prompt/common/chatVariablesCollection';
@@ -84,13 +84,14 @@ export class AgentPrompt extends PromptElement<AgentPromptProps> {
 		@IWorkspaceService private readonly workspaceService: IWorkspaceService,
 		@IFileSystemService private readonly fileSystemService: IFileSystemService,
 		@ITelemetryService private readonly telemetryService: ITelemetryService,
+		@ILogService private readonly logService: ILogService,
 	) {
 		super(props);
 		this.sessionManager = new AgentSessionManager(
-			this.instantiationService,
 			this.workspaceService,
 			this.fileSystemService,
-			this.telemetryService
+			this.telemetryService,
+			this.logService
 		);
 	}
 

@@ -11,6 +11,7 @@ import { TextDocumentSnapshot } from '../../../platform/editing/common/textDocum
 import { IEndpointProvider } from '../../../platform/endpoint/common/endpointProvider';
 import { IFileSystemService } from '../../../platform/filesystem/common/fileSystemService';
 import { ILanguageDiagnosticsService } from '../../../platform/languages/common/languageDiagnosticsService';
+import { ILogService } from '../../../platform/log/common/logService';
 import { IAlternativeNotebookContentService } from '../../../platform/notebook/common/alternativeContent';
 import { IAlternativeNotebookContentEditGenerator, NotebookEditGenerationTelemtryOptions, NotebookEditGenrationSource } from '../../../platform/notebook/common/alternativeContentEditGenerator';
 import { INotebookService } from '../../../platform/notebook/common/notebookService';
@@ -30,6 +31,7 @@ import { processFullRewriteNotebook } from '../../prompts/node/codeMapper/codeMa
 import { ToolName } from '../common/toolNames';
 import { ICopilotTool, ToolRegistry } from '../common/toolsRegistry';
 import { IToolsService } from '../common/toolsService';
+import { AgentSessionManager, IAgentSessionManager } from './agentSessionManager';
 import { ActionType } from './applyPatch/parser';
 import { CorrectedEditResult, healReplaceStringParams } from './editFileHealing';
 import { EditFileResult } from './editFileToolResult';
@@ -48,6 +50,7 @@ export class ReplaceStringTool implements ICopilotTool<IReplaceStringToolParams>
 	public static toolName = ToolName.ReplaceString;
 
 	private _promptContext: IBuildPromptContext | undefined;
+	private sessionManager: IAgentSessionManager;
 
 	constructor(
 		@IPromptPathRepresentationService protected readonly promptPathRepresentationService: IPromptPathRepresentationService,
@@ -62,8 +65,16 @@ export class ReplaceStringTool implements ICopilotTool<IReplaceStringToolParams>
 		@ILanguageDiagnosticsService private readonly languageDiagnosticsService: ILanguageDiagnosticsService,
 		@ITelemetryService private readonly telemetryService: ITelemetryService,
 		@IEndpointProvider private readonly endpointProvider: IEndpointProvider,
-		@IExperimentationService private readonly experimentationService: IExperimentationService
-	) { }
+		@IExperimentationService private readonly experimentationService: IExperimentationService,
+		@ILogService private readonly logService: ILogService,
+	) {
+		this.sessionManager = new AgentSessionManager(
+			this.workspaceService,
+			this.fileSystemService,
+			this.telemetryService,
+			this.logService
+		);
+	}
 
 	async invoke(options: vscode.LanguageModelToolInvocationOptions<IReplaceStringToolParams>, token: vscode.CancellationToken) {
 		const uri = resolveToolInputPath(options.input.filePath, this.promptPathRepresentationService);
@@ -220,6 +231,9 @@ export class ReplaceStringTool implements ICopilotTool<IReplaceStringToolParams>
 		const oldString = removeLeadingFilepathComment(options.input.oldString, document.languageId, filePath).replace(/\r?\n/g, eol);
 		const newString = removeLeadingFilepathComment(options.input.newString, document.languageId, filePath).replace(/\r?\n/g, eol);
 
+		// 获取编辑前的文件内容用于跟踪变化
+		const originalContent = document.getText();
+
 		// Apply the edit using the improved applyEdit function that uses VS Code APIs
 		const workspaceEdit = new WorkspaceEdit();
 		let updatedFile: string;
@@ -235,6 +249,9 @@ export class ReplaceStringTool implements ICopilotTool<IReplaceStringToolParams>
 				this._promptContext?.request?.model
 			);
 			updatedFile = result.updatedFile;
+
+			// 跟踪文件变化
+			await this.trackFileChange(uri, originalContent, updatedFile);
 		} catch (e) {
 			if (!(e instanceof NoMatchError)) {
 				throw e;
@@ -277,6 +294,9 @@ export class ReplaceStringTool implements ICopilotTool<IReplaceStringToolParams>
 					this._promptContext?.request?.model
 				);
 				updatedFile = result.updatedFile;
+
+				// 跟踪文件变化（healing后的版本）
+				await this.trackFileChange(uri, originalContent, updatedFile);
 			} catch (e2) {
 				this.sendHealingTelemetry(options, undefined, String(e2));
 				throw e; // original error
@@ -284,6 +304,18 @@ export class ReplaceStringTool implements ICopilotTool<IReplaceStringToolParams>
 		}
 
 		return { workspaceEdit, updatedFile };
+	}
+
+	private async trackFileChange(uri: URI, oldContent: string, newContent: string): Promise<void> {
+		try {
+			// 只有在agent模式下才跟踪文件变化
+			if (this.sessionManager.isAgentMode()) {
+				const tracker = this.sessionManager.getCurrentSessionTracker();
+				await tracker.trackFileChange(uri, 'update', oldContent, newContent);
+			}
+		} catch (error) {
+			this.logService.warn(`Failed to track file change for ${uri.fsPath}: ${error}`);
+		}
 	}
 
 	private async sendReplaceTelemetry(outcome: string, options: vscode.LanguageModelToolInvocationOptions<IReplaceStringToolParams>, file: string | undefined, isNotebookDocument: boolean | undefined, didHeal: boolean | undefined) {

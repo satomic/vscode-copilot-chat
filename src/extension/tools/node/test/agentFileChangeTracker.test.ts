@@ -12,11 +12,11 @@ describe('AgentFileChangeTracker', () => {
 	let mockWorkspaceService: any;
 	let mockFileSystemService: any;
 	let mockTelemetryService: any;
-	let mockInstantiationService: any;
+	let mockLogService: any;
 
 	beforeEach(() => {
 		mockWorkspaceService = {
-			getWorkspaceFolder: () => ({ uri: URI.file('/test/workspace') })
+			getWorkspaceFolders: () => [URI.file('/test/workspace')]
 		};
 		mockFileSystemService = {
 			createDirectory: jest.fn(),
@@ -25,13 +25,17 @@ describe('AgentFileChangeTracker', () => {
 		mockTelemetryService = {
 			sendMSFTTelemetryEvent: jest.fn()
 		};
-		mockInstantiationService = {};
+		mockLogService = {
+			info: jest.fn(),
+			warn: jest.fn(),
+			error: jest.fn()
+		};
 
 		tracker = new AgentFileChangeTracker(
-			mockInstantiationService,
 			mockWorkspaceService,
 			mockFileSystemService,
-			mockTelemetryService
+			mockTelemetryService,
+			mockLogService
 		);
 	});
 

@@ -10,6 +10,7 @@ import { modelNeedsStrongReplaceStringHint } from '../../../platform/endpoint/co
 import { IEndpointProvider } from '../../../platform/endpoint/common/endpointProvider';
 import { IFileSystemService } from '../../../platform/filesystem/common/fileSystemService';
 import { ILanguageDiagnosticsService } from '../../../platform/languages/common/languageDiagnosticsService';
+import { ILogService } from '../../../platform/log/common/logService';
 import { IPromptPathRepresentationService } from '../../../platform/prompts/common/promptPathRepresentationService';
 import { ISimulationTestContext } from '../../../platform/simulationTestContext/common/simulationTestContext';
 import { ITelemetryService } from '../../../platform/telemetry/common/telemetry';
@@ -52,13 +53,14 @@ export class EditFileResult extends PromptElement<IEditFileResultProps> {
 		@ITelemetryService private readonly telemetryService: ITelemetryService,
 		@IEndpointProvider private readonly endpointProvider: IEndpointProvider,
 		@IFileSystemService private readonly fileSystemService: IFileSystemService,
+		@ILogService private readonly logService: ILogService,
 	) {
 		super(props);
 		this.sessionManager = new AgentSessionManager(
-			props.instantiationService,
 			this.workspaceService,
 			this.fileSystemService,
-			this.telemetryService
+			this.telemetryService,
+			this.logService
 		);
 	}
 
@@ -69,35 +71,36 @@ export class EditFileResult extends PromptElement<IEditFileResultProps> {
 		let totalNewDiagnostics = 0;
 		let filesWithNewDiagnostics = 0;
 
-		// 跟踪文件变化
+		// 处理文件编辑结果并跟踪文件变化
 		for (const file of this.props.files) {
 			if (file.error) {
 				editingErrors.push(file.error);
 				continue;
 			}
 
-			// 获取文件修改前后的内容用于计算行数变化
-			let oldContent: string | undefined;
-			let newContent: string | undefined;
+			// 跟踪文件变化（如果在agent模式下）
+			if (this.sessionManager.isAgentMode()) {
+				try {
+					const tracker = this.sessionManager.getCurrentSessionTracker();
 
-			try {
-				if (file.operation === 'update' || file.operation === 'delete') {
-					// 尝试获取修改前的内容
-					const oldSnapshot = await this.workspaceService.openTextDocumentAndSnapshot(file.uri);
-					oldContent = oldSnapshot.getText();
+					// 对于EditFileResult，我们基于operation类型进行跟踪
+					// 由于我们在edit之后，无法获取编辑前的内容，所以使用简化的跟踪方式
+					let newContent: string | undefined;
+					if (file.operation === 'add' || file.operation === 'update') {
+						try {
+							const snapshot = await this.workspaceService.openTextDocumentAndSnapshot(file.uri);
+							newContent = snapshot.getText();
+						} catch (error) {
+							this.logService.warn(`Failed to get content for ${file.operation} file ${file.uri.fsPath}: ${error}`);
+						}
+					}
+
+					await tracker.trackFileChange(file.uri, file.operation, undefined, newContent);
+
+					this.logService.info(`Tracked file change: ${file.uri.fsPath} (${file.operation})`);
+				} catch (error) {
+					this.logService.warn(`Failed to track file change for ${file.uri.fsPath}: ${error}`);
 				}
-
-				if (file.operation === 'add' || file.operation === 'update') {
-					// 获取修改后的内容
-					const newSnapshot = await this.workspaceService.openTextDocumentAndSnapshot(file.uri);
-					newContent = newSnapshot.getText();
-				}
-
-				// 跟踪文件变化
-				const tracker = this.sessionManager.getCurrentSessionTracker();
-				await tracker.trackFileChange(file.uri, file.operation, oldContent, newContent);
-			} catch (error) {
-				console.warn(`Failed to track file change for ${file.uri.fsPath}:`, error);
 			}
 
 			const diagnostics = !this.testContext.isInSimulationTests && this.configurationService.getConfig(ConfigKey.AutoFixDiagnostics) && !(file.isNotebook)
@@ -129,14 +132,18 @@ export class EditFileResult extends PromptElement<IEditFileResultProps> {
 			await this.sendEditFileResultTelemetry(totalNewDiagnostics, filesWithNewDiagnostics);
 		}
 
-		// 如果有文件被修改，打印统计信息并保存JSON文件
-		if (successfullyEditedFiles.length > 0) {
-			// 打印统计信息到OUTPUT
+		// 检查是否应该打印Agent会话统计信息
+		if (successfullyEditedFiles.length > 0 && this.sessionManager.isAgentMode()) {
 			const tracker = this.sessionManager.getCurrentSessionTracker();
-			tracker.printSessionStats();
+			const sessionStats = tracker.getSessionStats();
 
-			// 保存统计信息到JSON文件
-			await tracker.saveSessionStats();
+			this.logService.info(`Agent session has modified ${sessionStats.totalFilesChanged} files so far`);
+
+			// 如果有文件变化，打印详细统计信息并保存JSON
+			if (sessionStats.totalFilesChanged > 0) {
+				tracker.printSessionStats();
+				await tracker.saveSessionStats();
+			}
 		}
 
 		return (

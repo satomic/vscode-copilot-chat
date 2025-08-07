@@ -4,10 +4,10 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { IFileSystemService } from '../../../platform/filesystem/common/fileSystemService';
+import { ILogService } from '../../../platform/log/common/logService';
 import { ITelemetryService } from '../../../platform/telemetry/common/telemetry';
 import { IWorkspaceService } from '../../../platform/workspace/common/workspaceService';
 import { URI } from '../../../util/vs/base/common/uri';
-import { IInstantiationService } from '../../../util/vs/platform/instantiation/common/instantiation';
 
 export interface IFileChangeStats {
 	filePath: string;
@@ -54,13 +54,12 @@ export interface IAgentFileChangeTracker {
 
 export class AgentFileChangeTracker implements IAgentFileChangeTracker {
 	private sessionStats: IAgentSessionStats;
-	private readonly outputChannelName = 'Agent File Changes';
 
 	constructor(
-		@IInstantiationService private readonly instantiationService: IInstantiationService,
 		@IWorkspaceService private readonly workspaceService: IWorkspaceService,
 		@IFileSystemService private readonly fileSystemService: IFileSystemService,
 		@ITelemetryService private readonly telemetryService: ITelemetryService,
+		@ILogService private readonly logService: ILogService,
 	) {
 		this.sessionStats = this.createNewSession();
 	}
@@ -130,22 +129,25 @@ export class AgentFileChangeTracker implements IAgentFileChangeTracker {
 
 		// 使用简单的行数差异计算
 		// 这里可以根据需要实现更复杂的diff算法，比如使用Myers diff算法
-		if (newLines.length > oldLines.length) {
-			addedLines = newLines.length - oldLines.length;
-		} else if (oldLines.length > newLines.length) {
-			removedLines = oldLines.length - newLines.length;
-		}
+		const oldLineCount = oldLines.length;
+		const newLineCount = newLines.length;
 
-		// 如果行数相同，检查内容变化
-		if (addedLines === 0 && removedLines === 0) {
-			// 检查是否有内容变化
-			for (let i = 0; i < Math.min(oldLines.length, newLines.length); i++) {
+		if (newLineCount > oldLineCount) {
+			addedLines = newLineCount - oldLineCount;
+		} else if (oldLineCount > newLineCount) {
+			removedLines = oldLineCount - newLineCount;
+		} else {
+			// 如果行数相同，检查内容变化
+			let changedLines = 0;
+			for (let i = 0; i < Math.min(oldLineCount, newLineCount); i++) {
 				if (oldLines[i] !== newLines[i]) {
-					// 如果内容有变化，假设是替换了一行
-					addedLines = 1;
-					removedLines = 1;
-					break;
+					changedLines++;
 				}
+			}
+			// 对于内容变化但行数相同的情况，我们认为是替换了那些变化的行
+			if (changedLines > 0) {
+				addedLines = changedLines;
+				removedLines = changedLines;
 			}
 		}
 
@@ -167,47 +169,60 @@ export class AgentFileChangeTracker implements IAgentFileChangeTracker {
 		}
 
 		try {
-			const workspaceRoot = this.workspaceService.getWorkspaceFolder()?.uri;
-			if (!workspaceRoot) {
-				console.warn('No workspace root found, cannot save session stats');
+			const workspaceFolders = this.workspaceService.getWorkspaceFolders();
+			if (!workspaceFolders || workspaceFolders.length === 0) {
+				this.logService.warn('No workspace root found, cannot save session stats');
 				return;
 			}
 
+			const workspaceRoot = workspaceFolders[0];
 			const statsDir = URI.joinPath(workspaceRoot, '.vscode', 'agent-stats');
-			await this.fileSystemService.createDirectory(statsDir, { recursive: true });
+
+			try {
+				await this.fileSystemService.createDirectory(statsDir);
+			} catch (error) {
+				// 目录可能已经存在，忽略错误
+			}
 
 			const statsFile = URI.joinPath(statsDir, `agent-session-${this.sessionStats.sessionId}.json`);
 			const statsContent = JSON.stringify(this.sessionStats, null, 2);
 
 			await this.fileSystemService.writeFile(statsFile, Buffer.from(statsContent, 'utf8'));
 
-			console.log(`Agent session stats saved to: ${statsFile.fsPath}`);
+			this.logService.info(`Agent session stats saved to: ${statsFile.fsPath}`);
 		} catch (error) {
-			console.error('Failed to save agent session stats:', error);
+			this.logService.error('Failed to save agent session stats:', error);
 		}
 	}
 
 	printSessionStats(): void {
 		if (this.sessionStats.totalFilesChanged === 0) {
-			console.log('No files were modified in this agent session.');
+			this.logService.info('No files were modified in this agent session.');
 			return;
 		}
 
-		console.log('\n=== Agent File Changes Summary ===');
-		console.log(`Session ID: ${this.sessionStats.sessionId}`);
-		console.log(`Timestamp: ${this.sessionStats.timestamp}`);
-		console.log(`Total Files Changed: ${this.sessionStats.totalFilesChanged}`);
-		console.log(`Total Lines Added: +${this.sessionStats.totalAddedLines}`);
-		console.log(`Total Lines Removed: -${this.sessionStats.totalRemovedLines}`);
-		console.log(`Net Change: ${this.sessionStats.totalAddedLines - this.sessionStats.totalRemovedLines > 0 ? '+' : ''}${this.sessionStats.totalAddedLines - this.sessionStats.totalRemovedLines}`);
+		const statsMessage = [
+			'\n=== Agent File Changes Summary ===',
+			`Session ID: ${this.sessionStats.sessionId}`,
+			`Timestamp: ${this.sessionStats.timestamp}`,
+			`Total Files Changed: ${this.sessionStats.totalFilesChanged}`,
+			`Total Lines Added: +${this.sessionStats.totalAddedLines}`,
+			`Total Lines Removed: -${this.sessionStats.totalRemovedLines}`,
+			`Net Change: ${this.sessionStats.totalAddedLines - this.sessionStats.totalRemovedLines > 0 ? '+' : ''}${this.sessionStats.totalAddedLines - this.sessionStats.totalRemovedLines}`,
+			'',
+			'File Changes:'
+		];
 
-		console.log('\nFile Changes:');
 		this.sessionStats.fileChanges.forEach(change => {
 			const netChange = change.addedLines - change.removedLines;
 			const changeIndicator = netChange > 0 ? '+' : netChange < 0 ? '-' : '=';
-			console.log(`  ${changeIndicator} ${change.filePath} (+${change.addedLines}, -${change.removedLines}) [${change.operation}]`);
+			statsMessage.push(`  ${changeIndicator} ${change.filePath} (+${change.addedLines}, -${change.removedLines}) [${change.operation}]`);
 		});
-		console.log('================================\n');
+
+		statsMessage.push('================================\n');
+
+		// 使用logService.info输出完整的统计信息
+		this.logService.info(statsMessage.join('\n'));
 	}
 
 	private sendFileChangeTelemetry(fileStats: IFileChangeStats): void {
