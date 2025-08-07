@@ -238,6 +238,15 @@ export class ReplaceStringTool implements ICopilotTool<IReplaceStringToolParams>
 		// 获取编辑前的文件内容用于跟踪变化
 		const originalContent = document.getText();
 
+		// 更详细的新文件创建检测
+		const isNewFileCreation = oldString === '';
+
+		this.logService.info(`[DEBUG] generateEdit: filePath=${filePath}`);
+		this.logService.info(`[DEBUG] generateEdit: oldString='${oldString}' (length: ${oldString.length})`);
+		this.logService.info(`[DEBUG] generateEdit: newString='${newString}' (length: ${newString.length})`);
+		this.logService.info(`[DEBUG] generateEdit: originalContent='${originalContent}' (length: ${originalContent.length})`);
+		this.logService.info(`[DEBUG] generateEdit: isNewFileCreation=${isNewFileCreation}`);
+
 		// Apply the edit using the improved applyEdit function that uses VS Code APIs
 		const workspaceEdit = new WorkspaceEdit();
 		let updatedFile: string;
@@ -254,8 +263,15 @@ export class ReplaceStringTool implements ICopilotTool<IReplaceStringToolParams>
 			);
 			updatedFile = result.updatedFile;
 
-			// 使用patch信息跟踪文件变化
-			await this.trackFileChangeWithPatch(uri, originalContent, updatedFile, result.patch);
+			// 对于新文件创建，使用特殊的跟踪方式避免触发Git操作
+			if (isNewFileCreation) {
+				this.logService.info(`[DEBUG] generateEdit: calling trackNewFileCreation`);
+				await this.trackNewFileCreation(uri, newString);
+			} else {
+				this.logService.info(`[DEBUG] generateEdit: calling trackFileChangeWithPatch`);
+				// 使用patch信息跟踪文件变化
+				await this.trackFileChangeWithPatch(uri, originalContent, updatedFile, result.patch);
+			}
 		} catch (e) {
 			if (!(e instanceof NoMatchError)) {
 				throw e;
@@ -310,6 +326,39 @@ export class ReplaceStringTool implements ICopilotTool<IReplaceStringToolParams>
 		return { workspaceEdit, updatedFile };
 	}
 
+	private async trackNewFileCreation(uri: URI, newContent: string): Promise<void> {
+		try {
+			this.logService.info(`[DEBUG] trackNewFileCreation: Starting for ${uri.fsPath}`);
+			this.logService.info(`[DEBUG] trackNewFileCreation: newContent length=${newContent.length}`);
+
+			// 只有在agent模式下才跟踪文件变化
+			if (this.getSessionManager().isAgentMode()) {
+				this.logService.info(`[DEBUG] trackNewFileCreation: In agent mode`);
+
+				const tracker = this.getSessionManager().getCurrentSessionTracker();
+				this.logService.info(`[DEBUG] trackNewFileCreation: Got tracker: ${!!tracker}`);
+
+				// 新文件创建，直接使用内容计算行数，避免任何可能触发Git操作的调用
+				const lines = newContent.split('\n');
+				const addedLines = newContent.endsWith('\n') && lines[lines.length - 1] === ''
+					? Math.max(1, lines.length - 1)
+					: lines.length;
+
+				this.logService.info(`[DEBUG] trackNewFileCreation: lines array length=${lines.length}`);
+				this.logService.info(`[DEBUG] trackNewFileCreation: calculated addedLines=${addedLines}`);
+				this.logService.info(`[DEBUG] trackNewFileCreation: newContent ends with newline=${newContent.endsWith('\n')}`);
+
+				await tracker.trackFileChangeWithExactLines(uri, 'add', addedLines, 0);
+
+				this.logService.info(`[DEBUG] trackNewFileCreation: trackFileChangeWithExactLines completed`);
+			} else {
+				this.logService.info(`[DEBUG] trackNewFileCreation: Not in agent mode, skipping track`);
+			}
+		} catch (error) {
+			this.logService.error(`[DEBUG] trackNewFileCreation: Failed to track new file creation for ${uri.fsPath}: ${error}`);
+		}
+	}
+
 	private async trackFileChangeWithPatch(uri: URI, oldContent: string, newContent: string, patch: any[]): Promise<void> {
 		try {
 			// 只有在agent模式下才跟踪文件变化
@@ -318,35 +367,49 @@ export class ReplaceStringTool implements ICopilotTool<IReplaceStringToolParams>
 
 				const tracker = this.getSessionManager().getCurrentSessionTracker();
 
-				// 使用patch中的精确行数信息
-				if (patch && patch.length > 0) {
-					const hunk = patch[0]; // 取第一个hunk
-					const oldLines = hunk.oldLines || 0;
-					const newLines = hunk.newLines || 0;
+				// 更好的新文件检测逻辑：检查文件是否真的存在于文件系统中
+				let isNewFile = false;
+				try {
+					await this.fileSystemService.stat(uri);
+					// 如果stat成功，文件存在，检查是否有旧内容
+					isNewFile = !oldContent || oldContent.length === 0;
+					this.logService.info(`[DEBUG] File exists: ${uri.fsPath}, hasOldContent=${!!oldContent}`);
+				} catch (error) {
+					// 如果stat失败，说明文件不存在，这是新文件
+					isNewFile = true;
+					this.logService.info(`[DEBUG] File does not exist (new file): ${uri.fsPath}, error: ${error}`);
+				}
 
-					// 计算真正的添加和删除行数
-					let addedLines = 0;
-					let removedLines = 0;
-
-					if (newLines > oldLines) {
-						addedLines = newLines - oldLines;
-					} else if (oldLines > newLines) {
-						removedLines = oldLines - newLines;
-					} else if (oldLines > 0 && newLines > 0) {
-						// 如果行数相同但内容变化，我们假设有部分内容被替换
-						// 这里可以进一步优化，但目前先假设至少有1行变化
-						addedLines = 1;
-						removedLines = 1;
-					}
-
-					this.logService.info(`[DEBUG] Using patch info: oldLines=${oldLines}, newLines=${newLines}, calculated: +${addedLines}, -${removedLines}`);
-
-					// 使用精确的行数信息
-					await tracker.trackFileChangeWithExactLines(uri, 'update', addedLines, removedLines);
+				if (isNewFile) {
+					// 新文件创建，直接使用内容计算行数
+					this.logService.info(`[DEBUG] New file detected, calculating lines from content`);
+					const lines = newContent.split('\n');
+					const addedLines = newContent.endsWith('\n') && lines[lines.length - 1] === ''
+						? Math.max(1, lines.length - 1)
+						: lines.length;
+					await tracker.trackFileChangeWithExactLines(uri, 'add', addedLines, 0);
 				} else {
-					// 如果没有patch信息，回退到原来的方法
-					this.logService.info(`[DEBUG] No patch info available, falling back to content diff`);
-					await tracker.trackFileChange(uri, 'update', oldContent, newContent);
+					// 使用patch中的精确行数信息
+					if (patch && patch.length > 0) {
+						const hunk = patch[0]; // 取第一个hunk
+						const oldLines = hunk.oldLines || 0;
+						const newLines = hunk.newLines || 0;
+
+						// 使用实际的增加和删除行数
+						// addedLines = 新增的行数 = newLines
+						// removedLines = 删除的行数 = oldLines
+						const addedLines = newLines;
+						const removedLines = oldLines;
+
+						this.logService.info(`[DEBUG] Using patch info: oldLines=${oldLines}, newLines=${newLines}, result: +${addedLines}, -${removedLines}`);
+
+						// 使用精确的行数信息
+						await tracker.trackFileChangeWithExactLines(uri, 'update', addedLines, removedLines);
+					} else {
+						// 如果没有patch信息，回退到原来的方法
+						this.logService.info(`[DEBUG] No patch info available, falling back to content diff`);
+						await tracker.trackFileChange(uri, 'update', oldContent, newContent);
+					}
 				}
 
 				this.logService.info(`[DEBUG] ReplaceStringTool trackFileChangeWithPatch completed`);

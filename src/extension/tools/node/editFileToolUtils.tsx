@@ -377,12 +377,90 @@ function trySimilarityMatch(text: string, oldStr: string, newStr: string, eol: s
 
 // Function to generate a simple patch
 function getPatch({ fileContents, oldStr, newStr }: { fileContents: string; oldStr: string; newStr: string }): Hunk[] {
-	// Simplified patch generation - in a real implementation this would generate proper diff hunks
+	// 使用更精确的 diff 算法
+	function calculateLineDiff(oldContent: string, newContent: string): { addedLines: number; removedLines: number } {
+		if (!oldContent && !newContent) {
+			return { addedLines: 0, removedLines: 0 };
+		}
+
+		if (!oldContent) {
+			// 全新内容，正确计算行数
+			if (!newContent || newContent.trim() === '') {
+				return { addedLines: 0, removedLines: 0 };
+			}
+			// 对于新文件，计算实际的行数
+			const lines = newContent.split('\n');
+			// 如果最后一行是空行，不计入（除非内容以换行符结尾）
+			const actualLineCount = newContent.endsWith('\n') ? lines.length - 1 : lines.length;
+			return { addedLines: Math.max(1, actualLineCount), removedLines: 0 };
+		}
+
+		if (!newContent) {
+			// 删除全部内容，正确计算行数
+			if (!oldContent || oldContent.trim() === '') {
+				return { addedLines: 0, removedLines: 0 };
+			}
+			// 计算被删除的实际行数
+			const lines = oldContent.split('\n');
+			const actualLineCount = oldContent.endsWith('\n') ? lines.length - 1 : lines.length;
+			return { addedLines: 0, removedLines: Math.max(1, actualLineCount) };
+		}
+
+		const oldLines = oldContent.split('\n');
+		const newLines = newContent.split('\n');
+
+		// 使用类似 Git diff 的算法：基于 LCS (最长公共子序列)
+		const lcs = findLCS(oldLines, newLines);
+
+		// 计算实际的增加和删除
+		const addedLines = newLines.length - lcs.length;
+		const removedLines = oldLines.length - lcs.length;
+
+		return { addedLines: Math.max(0, addedLines), removedLines: Math.max(0, removedLines) };
+	}
+
+	// 简单的 LCS 算法实现
+	function findLCS(arr1: string[], arr2: string[]): string[] {
+		const m = arr1.length;
+		const n = arr2.length;
+		const dp: number[][] = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
+
+		// 填充 DP 表
+		for (let i = 1; i <= m; i++) {
+			for (let j = 1; j <= n; j++) {
+				if (arr1[i - 1] === arr2[j - 1]) {
+					dp[i][j] = dp[i - 1][j - 1] + 1;
+				} else {
+					dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+				}
+			}
+		}
+
+		// 重构 LCS
+		const lcs: string[] = [];
+		let i = m, j = n;
+		while (i > 0 && j > 0) {
+			if (arr1[i - 1] === arr2[j - 1]) {
+				lcs.unshift(arr1[i - 1]);
+				i--;
+				j--;
+			} else if (dp[i - 1][j] > dp[i][j - 1]) {
+				i--;
+			} else {
+				j--;
+			}
+		}
+
+		return lcs;
+	}
+
+	const diff = calculateLineDiff(oldStr, newStr);
+
 	return [{
 		oldStart: 1,
-		oldLines: (oldStr.match(/\n/g) || []).length + 1,
+		oldLines: diff.removedLines,
 		newStart: 1,
-		newLines: (newStr.match(/\n/g) || []).length + 1,
+		newLines: diff.addedLines,
 		lines: []
 	}];
 }
@@ -499,11 +577,11 @@ export async function applyEdit(
 			}
 		}
 
-		// Generate a simple patch
+		// Generate a simple patch using the actual strings being replaced
 		const patch = getPatch({
 			fileContents: originalFile,
-			oldStr: originalFile,
-			newStr: updatedFile,
+			oldStr: old_string,
+			newStr: new_string,
 		});
 
 		return { patch, updatedFile };
@@ -515,8 +593,8 @@ export async function applyEdit(
 
 			const patch = getPatch({
 				fileContents: originalFile,
-				oldStr: originalFile,
-				newStr: updatedFile,
+				oldStr: old_string,
+				newStr: new_string,
 			});
 
 			return { patch, updatedFile };

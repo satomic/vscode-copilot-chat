@@ -121,15 +121,23 @@ export class AgentFileChangeTracker implements IAgentFileChangeTracker {
 		this.logService.info(`[DEBUG] oldContent length: ${oldContent ? oldContent.length : 'undefined'}, newContent length: ${newContent ? newContent.length : 'undefined'}`);
 
 		if (operation === 'add') {
-			// 新文件，所有行都是新增的
+			// 新文件，计算实际的行数
 			if (newContent) {
-				addedLines = newContent.split('\n').length;
+				const lines = newContent.split('\n');
+				// 如果内容以换行符结尾，最后一个空元素不算行数
+				addedLines = newContent.endsWith('\n') && lines[lines.length - 1] === ''
+					? Math.max(1, lines.length - 1)
+					: lines.length;
 				this.logService.info(`[DEBUG] New file: ${addedLines} lines added`);
 			}
 		} else if (operation === 'delete') {
-			// 删除文件，所有行都是删除的
+			// 删除文件，计算实际的行数
 			if (oldContent) {
-				removedLines = oldContent.split('\n').length;
+				const lines = oldContent.split('\n');
+				// 如果内容以换行符结尾，最后一个空元素不算行数
+				removedLines = oldContent.endsWith('\n') && lines[lines.length - 1] === ''
+					? Math.max(1, lines.length - 1)
+					: lines.length;
 				this.logService.info(`[DEBUG] Deleted file: ${removedLines} lines removed`);
 			}
 		} else if (operation === 'update' && oldContent && newContent) {

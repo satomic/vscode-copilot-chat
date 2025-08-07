@@ -6,7 +6,9 @@
 import * as l10n from '@vscode/l10n';
 import type * as vscode from 'vscode';
 import { TextDocumentSnapshot } from '../../../platform/editing/common/textDocumentSnapshot';
+import { IEndpointProvider } from '../../../platform/endpoint/common/endpointProvider';
 import { IFileSystemService } from '../../../platform/filesystem/common/fileSystemService';
+import { ILogService } from '../../../platform/log/common/logService';
 import { IAlternativeNotebookContentService } from '../../../platform/notebook/common/alternativeContent';
 import { IAlternativeNotebookContentEditGenerator, NotebookEditGenrationSource } from '../../../platform/notebook/common/alternativeContentEditGenerator';
 import { INotebookService } from '../../../platform/notebook/common/notebookService';
@@ -24,11 +26,11 @@ import { processFullRewrite, processFullRewriteNewNotebook } from '../../prompts
 import { ToolName } from '../common/toolNames';
 import { ICopilotTool, ToolRegistry } from '../common/toolsRegistry';
 import { IToolsService } from '../common/toolsService';
+import { AgentSessionSingleton } from './agentSessionSingleton';
 import { ActionType } from './applyPatch/parser';
 import { EditFileResult } from './editFileToolResult';
 import { sendEditNotebookTelemetry } from './editNotebookTool';
 import { assertFileOkForTool, formatUriForFileWidget, resolveToolInputPath } from './toolUtils';
-import { IEndpointProvider } from '../../../platform/endpoint/common/endpointProvider';
 
 export interface ICreateFileParams {
 	filePath: string;
@@ -41,6 +43,16 @@ export class CreateFileTool implements ICopilotTool<ICreateFileParams> {
 
 	private _promptContext: IBuildPromptContext | undefined;
 
+	// 获取单例的AgentSessionManager实例
+	private getSessionManager() {
+		return AgentSessionSingleton.getInstance(
+			this.workspaceService,
+			this.fileSystemService,
+			this.telemetryService,
+			this.logService
+		);
+	}
+
 	constructor(
 		@IPromptPathRepresentationService protected readonly promptPathRepresentationService: IPromptPathRepresentationService,
 		@IInstantiationService protected readonly instantiationService: IInstantiationService,
@@ -52,6 +64,7 @@ export class CreateFileTool implements ICopilotTool<ICreateFileParams> {
 		@IFileSystemService protected readonly fileSystemService: IFileSystemService,
 		@ITelemetryService protected readonly telemetryService: ITelemetryService,
 		@IEndpointProvider protected readonly endpointProvider: IEndpointProvider,
+		@ILogService protected readonly logService: ILogService,
 	) { }
 
 	async invoke(options: vscode.LanguageModelToolInvocationOptions<ICreateFileParams>, token: vscode.CancellationToken) {
@@ -108,6 +121,10 @@ export class CreateFileTool implements ICopilotTool<ICreateFileParams> {
 			const content = removeLeadingFilepathComment(options.input.content, doc!.languageId, options.input.filePath);
 			await processFullRewrite(uri, doc as TextDocumentSnapshot, content, this._promptContext.stream, token, []);
 			this._promptContext.stream.textEdit(uri, true);
+
+			// 跟踪新创建的文件
+			await this.trackNewFileCreation(uri, content);
+
 			return new LanguageModelToolResult([
 				new LanguageModelPromptTsxPart(
 					await renderPromptElementJSON(
@@ -129,6 +146,39 @@ export class CreateFileTool implements ICopilotTool<ICreateFileParams> {
 				`File created at ${this.promptPathRepresentationService.getFilePath(uri)}`,
 			)
 		]);
+	}
+
+	private async trackNewFileCreation(uri: URI, content: string): Promise<void> {
+		try {
+			this.logService.info(`[DEBUG] CreateFileTool trackNewFileCreation: Starting for ${uri.fsPath}`);
+			this.logService.info(`[DEBUG] CreateFileTool trackNewFileCreation: content length=${content.length}`);
+
+			// 只有在agent模式下才跟踪文件变化
+			if (this.getSessionManager().isAgentMode()) {
+				this.logService.info(`[DEBUG] CreateFileTool trackNewFileCreation: In agent mode`);
+
+				const tracker = this.getSessionManager().getCurrentSessionTracker();
+				this.logService.info(`[DEBUG] CreateFileTool trackNewFileCreation: Got tracker: ${!!tracker}`);
+
+				// 新文件创建，直接使用内容计算行数
+				const lines = content.split('\n');
+				const addedLines = content.endsWith('\n') && lines[lines.length - 1] === ''
+					? Math.max(1, lines.length - 1)
+					: lines.length;
+
+				this.logService.info(`[DEBUG] CreateFileTool trackNewFileCreation: lines array length=${lines.length}`);
+				this.logService.info(`[DEBUG] CreateFileTool trackNewFileCreation: calculated addedLines=${addedLines}`);
+				this.logService.info(`[DEBUG] CreateFileTool trackNewFileCreation: content ends with newline=${content.endsWith('\n')}`);
+
+				await tracker.trackFileChangeWithExactLines(uri, 'add', addedLines, 0);
+
+				this.logService.info(`[DEBUG] CreateFileTool trackNewFileCreation: trackFileChangeWithExactLines completed`);
+			} else {
+				this.logService.info(`[DEBUG] CreateFileTool trackNewFileCreation: Not in agent mode, skipping track`);
+			}
+		} catch (error) {
+			this.logService.error(`[DEBUG] CreateFileTool trackNewFileCreation: Failed to track new file creation for ${uri.fsPath}: ${error}`);
+		}
 	}
 
 	/**
