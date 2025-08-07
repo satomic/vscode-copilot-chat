@@ -20,7 +20,8 @@ import { timeout } from '../../../util/vs/base/common/async';
 import { URI } from '../../../util/vs/base/common/uri';
 import { Diagnostic, DiagnosticSeverity } from '../../../vscodeTypes';
 import { ToolName } from '../common/toolNames';
-import { AgentSessionManager, IAgentSessionManager } from './agentSessionManager';
+import { IAgentSessionManager } from './agentSessionManager';
+import { AgentSessionSingleton } from './agentSessionSingleton';
 import { DiagnosticToolOutput } from './getErrorsTool';
 
 export interface IEditedFile {
@@ -41,7 +42,15 @@ export interface IEditFileResultProps extends BasePromptElementProps {
 }
 
 export class EditFileResult extends PromptElement<IEditFileResultProps> {
-	private sessionManager: IAgentSessionManager;
+	// 获取单例的AgentSessionManager实例
+	private getSessionManager(): IAgentSessionManager {
+		return AgentSessionSingleton.getInstance(
+			this.workspaceService,
+			this.fileSystemService,
+			this.telemetryService,
+			this.logService
+		);
+	}
 
 	constructor(
 		props: PromptElementProps<IEditFileResultProps>,
@@ -56,12 +65,7 @@ export class EditFileResult extends PromptElement<IEditFileResultProps> {
 		@ILogService private readonly logService: ILogService,
 	) {
 		super(props);
-		this.sessionManager = new AgentSessionManager(
-			this.workspaceService,
-			this.fileSystemService,
-			this.telemetryService,
-			this.logService
-		);
+		// 不再创建自己的sessionManager，使用全局的
 	}
 
 	override async render(state: void, sizing: PromptSizing) {
@@ -78,32 +82,11 @@ export class EditFileResult extends PromptElement<IEditFileResultProps> {
 				continue;
 			}
 
-			// 跟踪文件变化（如果在agent模式下）
-			if (this.sessionManager.isAgentMode()) {
-				try {
-					const tracker = this.sessionManager.getCurrentSessionTracker();
-
-					// 对于EditFileResult，我们基于operation类型进行跟踪
-					// 由于我们在edit之后，无法获取编辑前的内容，所以使用简化的跟踪方式
-					let newContent: string | undefined;
-					if (file.operation === 'add' || file.operation === 'update') {
-						try {
-							const snapshot = await this.workspaceService.openTextDocumentAndSnapshot(file.uri);
-							newContent = snapshot.getText();
-						} catch (error) {
-							this.logService.warn(`Failed to get content for ${file.operation} file ${file.uri.fsPath}: ${error}`);
-						}
-					}
-
-					await tracker.trackFileChange(file.uri, file.operation, undefined, newContent);
-
-					this.logService.info(`Tracked file change: ${file.uri.fsPath} (${file.operation})`);
-				} catch (error) {
-					this.logService.warn(`Failed to track file change for ${file.uri.fsPath}: ${error}`);
-				}
-			}
-
-			const diagnostics = !this.testContext.isInSimulationTests && this.configurationService.getConfig(ConfigKey.AutoFixDiagnostics) && !(file.isNotebook)
+			// 文件变化跟踪现在在ReplaceStringTool中通过patch信息精确处理
+			// 这里只需要记录操作，不需要估算行数
+			if (this.getSessionManager().isAgentMode()) {
+				this.logService.info(`Processing file operation: ${file.uri.fsPath} (${file.operation})`);
+			} const diagnostics = !this.testContext.isInSimulationTests && this.configurationService.getConfig(ConfigKey.AutoFixDiagnostics) && !(file.isNotebook)
 				? await this.getNewDiagnostics(file)
 				: [];
 
@@ -133,8 +116,8 @@ export class EditFileResult extends PromptElement<IEditFileResultProps> {
 		}
 
 		// 检查是否应该打印Agent会话统计信息
-		if (successfullyEditedFiles.length > 0 && this.sessionManager.isAgentMode()) {
-			const tracker = this.sessionManager.getCurrentSessionTracker();
+		if (successfullyEditedFiles.length > 0 && this.getSessionManager().isAgentMode()) {
+			const tracker = this.getSessionManager().getCurrentSessionTracker();
 			const sessionStats = tracker.getSessionStats();
 
 			this.logService.info(`Agent session has modified ${sessionStats.totalFilesChanged} files so far`);

@@ -27,9 +27,14 @@ export interface IAgentSessionStats {
 
 export interface IAgentFileChangeTracker {
 	/**
-	 * 跟踪文件修改并计算行数变化
+	 * 跟踪文件变化
 	 */
 	trackFileChange(uri: URI, operation: 'add' | 'delete' | 'update', oldContent?: string, newContent?: string): Promise<IFileChangeStats>;
+
+	/**
+	 * 使用精确的行数信息跟踪文件变化
+	 */
+	trackFileChangeWithExactLines(uri: URI, operation: 'add' | 'delete' | 'update', addedLines: number, removedLines: number): Promise<IFileChangeStats>;
 
 	/**
 	 * 获取当前会话的统计信息
@@ -37,12 +42,12 @@ export interface IAgentFileChangeTracker {
 	getSessionStats(): IAgentSessionStats;
 
 	/**
-	 * 重置会话统计
+	 * 重置会话
 	 */
 	resetSession(sessionId: string): void;
 
 	/**
-	 * 保存会话统计到JSON文件
+	 * 保存当前会话统计到文件
 	 */
 	saveSessionStats(): Promise<void>;
 
@@ -79,26 +84,62 @@ export class AgentFileChangeTracker implements IAgentFileChangeTracker {
 		return `agent-session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 	}
 
+	async trackFileChangeWithExactLines(uri: URI, operation: 'add' | 'delete' | 'update', addedLines: number, removedLines: number): Promise<IFileChangeStats> {
+		const filePath = uri.fsPath;
+
+		// 添加调试日志
+		this.logService.info(`[DEBUG] trackFileChangeWithExactLines: ${filePath}, operation: ${operation}, +${addedLines}, -${removedLines}`);
+
+		const fileStats: IFileChangeStats = {
+			filePath,
+			addedLines,
+			removedLines,
+			operation
+		};
+
+		// 更新会话统计
+		this.sessionStats.fileChanges.push(fileStats);
+		this.sessionStats.totalFilesChanged++;
+		this.sessionStats.totalAddedLines += addedLines;
+		this.sessionStats.totalRemovedLines += removedLines;
+
+		// 发送遥测数据
+		this.sendFileChangeTelemetry(fileStats);
+
+		this.logService.info(`[DEBUG] Session totals now: files: ${this.sessionStats.totalFilesChanged}, +${this.sessionStats.totalAddedLines}, -${this.sessionStats.totalRemovedLines}`);
+
+		return fileStats;
+	}
+
 	async trackFileChange(uri: URI, operation: 'add' | 'delete' | 'update', oldContent?: string, newContent?: string): Promise<IFileChangeStats> {
 		const filePath = uri.fsPath;
 		let addedLines = 0;
 		let removedLines = 0;
 
+		// 添加调试日志
+		this.logService.info(`[DEBUG] trackFileChange: ${filePath}, operation: ${operation}`);
+		this.logService.info(`[DEBUG] oldContent length: ${oldContent ? oldContent.length : 'undefined'}, newContent length: ${newContent ? newContent.length : 'undefined'}`);
+
 		if (operation === 'add') {
 			// 新文件，所有行都是新增的
 			if (newContent) {
 				addedLines = newContent.split('\n').length;
+				this.logService.info(`[DEBUG] New file: ${addedLines} lines added`);
 			}
 		} else if (operation === 'delete') {
 			// 删除文件，所有行都是删除的
 			if (oldContent) {
 				removedLines = oldContent.split('\n').length;
+				this.logService.info(`[DEBUG] Deleted file: ${removedLines} lines removed`);
 			}
 		} else if (operation === 'update' && oldContent && newContent) {
 			// 更新文件，计算差异
 			const diff = this.calculateLineDiff(oldContent, newContent);
 			addedLines = diff.addedLines;
 			removedLines = diff.removedLines;
+			this.logService.info(`[DEBUG] Updated file: +${addedLines}, -${removedLines} lines`);
+		} else {
+			this.logService.info(`[DEBUG] No diff calculated - operation: ${operation}, oldContent: ${!!oldContent}, newContent: ${!!newContent}`);
 		}
 
 		const fileStats: IFileChangeStats = {
@@ -116,6 +157,8 @@ export class AgentFileChangeTracker implements IAgentFileChangeTracker {
 
 		// 发送遥测数据
 		this.sendFileChangeTelemetry(fileStats);
+
+		this.logService.info(`[DEBUG] Session totals now: files: ${this.sessionStats.totalFilesChanged}, +${this.sessionStats.totalAddedLines}, -${this.sessionStats.totalRemovedLines}`);
 
 		return fileStats;
 	}

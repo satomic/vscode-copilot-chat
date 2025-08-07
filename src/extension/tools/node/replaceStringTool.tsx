@@ -31,7 +31,8 @@ import { processFullRewriteNotebook } from '../../prompts/node/codeMapper/codeMa
 import { ToolName } from '../common/toolNames';
 import { ICopilotTool, ToolRegistry } from '../common/toolsRegistry';
 import { IToolsService } from '../common/toolsService';
-import { AgentSessionManager, IAgentSessionManager } from './agentSessionManager';
+import { IAgentSessionManager } from './agentSessionManager';
+import { AgentSessionSingleton } from './agentSessionSingleton';
 import { ActionType } from './applyPatch/parser';
 import { CorrectedEditResult, healReplaceStringParams } from './editFileHealing';
 import { EditFileResult } from './editFileToolResult';
@@ -50,7 +51,15 @@ export class ReplaceStringTool implements ICopilotTool<IReplaceStringToolParams>
 	public static toolName = ToolName.ReplaceString;
 
 	private _promptContext: IBuildPromptContext | undefined;
-	private sessionManager: IAgentSessionManager;
+	// 获取单例的AgentSessionManager实例
+	private getSessionManager(): IAgentSessionManager {
+		return AgentSessionSingleton.getInstance(
+			this.workspaceService,
+			this.fileSystemService,
+			this.telemetryService,
+			this.logService
+		);
+	}
 
 	constructor(
 		@IPromptPathRepresentationService protected readonly promptPathRepresentationService: IPromptPathRepresentationService,
@@ -68,12 +77,7 @@ export class ReplaceStringTool implements ICopilotTool<IReplaceStringToolParams>
 		@IExperimentationService private readonly experimentationService: IExperimentationService,
 		@ILogService private readonly logService: ILogService,
 	) {
-		this.sessionManager = new AgentSessionManager(
-			this.workspaceService,
-			this.fileSystemService,
-			this.telemetryService,
-			this.logService
-		);
+		// 不再创建自己的sessionManager，使用全局的
 	}
 
 	async invoke(options: vscode.LanguageModelToolInvocationOptions<IReplaceStringToolParams>, token: vscode.CancellationToken) {
@@ -250,8 +254,8 @@ export class ReplaceStringTool implements ICopilotTool<IReplaceStringToolParams>
 			);
 			updatedFile = result.updatedFile;
 
-			// 跟踪文件变化
-			await this.trackFileChange(uri, originalContent, updatedFile);
+			// 使用patch信息跟踪文件变化
+			await this.trackFileChangeWithPatch(uri, originalContent, updatedFile, result.patch);
 		} catch (e) {
 			if (!(e instanceof NoMatchError)) {
 				throw e;
@@ -295,8 +299,8 @@ export class ReplaceStringTool implements ICopilotTool<IReplaceStringToolParams>
 				);
 				updatedFile = result.updatedFile;
 
-				// 跟踪文件变化（healing后的版本）
-				await this.trackFileChange(uri, originalContent, updatedFile);
+				// 使用patch信息跟踪文件变化（healing后的版本）
+				await this.trackFileChangeWithPatch(uri, originalContent, updatedFile, result.patch);
 			} catch (e2) {
 				this.sendHealingTelemetry(options, undefined, String(e2));
 				throw e; // original error
@@ -306,15 +310,51 @@ export class ReplaceStringTool implements ICopilotTool<IReplaceStringToolParams>
 		return { workspaceEdit, updatedFile };
 	}
 
-	private async trackFileChange(uri: URI, oldContent: string, newContent: string): Promise<void> {
+	private async trackFileChangeWithPatch(uri: URI, oldContent: string, newContent: string, patch: any[]): Promise<void> {
 		try {
 			// 只有在agent模式下才跟踪文件变化
-			if (this.sessionManager.isAgentMode()) {
-				const tracker = this.sessionManager.getCurrentSessionTracker();
-				await tracker.trackFileChange(uri, 'update', oldContent, newContent);
+			if (this.getSessionManager().isAgentMode()) {
+				this.logService.info(`[DEBUG] ReplaceStringTool trackFileChangeWithPatch called for: ${uri.fsPath}`);
+
+				const tracker = this.getSessionManager().getCurrentSessionTracker();
+
+				// 使用patch中的精确行数信息
+				if (patch && patch.length > 0) {
+					const hunk = patch[0]; // 取第一个hunk
+					const oldLines = hunk.oldLines || 0;
+					const newLines = hunk.newLines || 0;
+
+					// 计算真正的添加和删除行数
+					let addedLines = 0;
+					let removedLines = 0;
+
+					if (newLines > oldLines) {
+						addedLines = newLines - oldLines;
+					} else if (oldLines > newLines) {
+						removedLines = oldLines - newLines;
+					} else if (oldLines > 0 && newLines > 0) {
+						// 如果行数相同但内容变化，我们假设有部分内容被替换
+						// 这里可以进一步优化，但目前先假设至少有1行变化
+						addedLines = 1;
+						removedLines = 1;
+					}
+
+					this.logService.info(`[DEBUG] Using patch info: oldLines=${oldLines}, newLines=${newLines}, calculated: +${addedLines}, -${removedLines}`);
+
+					// 使用精确的行数信息
+					await tracker.trackFileChangeWithExactLines(uri, 'update', addedLines, removedLines);
+				} else {
+					// 如果没有patch信息，回退到原来的方法
+					this.logService.info(`[DEBUG] No patch info available, falling back to content diff`);
+					await tracker.trackFileChange(uri, 'update', oldContent, newContent);
+				}
+
+				this.logService.info(`[DEBUG] ReplaceStringTool trackFileChangeWithPatch completed`);
+			} else {
+				this.logService.info(`[DEBUG] ReplaceStringTool not in agent mode, skipping track`);
 			}
 		} catch (error) {
-			this.logService.warn(`Failed to track file change for ${uri.fsPath}: ${error}`);
+			this.logService.warn(`Failed to track file change with patch for ${uri.fsPath}: ${error}`);
 		}
 	}
 
