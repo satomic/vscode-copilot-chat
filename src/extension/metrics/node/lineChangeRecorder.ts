@@ -17,7 +17,9 @@ import { URI } from '../../../util/vs/base/common/uri';
 import { ChatResponseTextEditPart, Uri } from '../../../vscodeTypes';
 
 interface FileDelta { file: string; language: string; added: number; removed: number }
-interface TurnRecord {
+
+// New single-file record format
+interface SingleFileRecord {
 	version: 1;
 	timestamp: string;
 	sessionId: string;
@@ -28,8 +30,10 @@ interface TurnRecord {
 	gitUrl?: string;
 	vscodeVersion?: string;
 	model?: string;
-	totals: { added: number; removed: number };
-	files: FileDelta[];
+	file: string;
+	language: string;
+	added: number;
+	removed: number;
 }
 
 /**
@@ -54,50 +58,93 @@ export function wireLineChangeRecorder(
 ): ChatResponseStream {
 	// Capture original text per file on first edit seen
 	const originals = new Map<string, string>();
+	const originalPromises = new Map<string, Promise<string>>();
 	const touched = new Map<string, Uri>();
+	const persisted = new Set<string>();
 
 	const spy = ChatResponseStreamImpl.spy(
 		stream,
 		(part) => {
-			// Only track text edits; capture original content once per URI
-			if (part instanceof ChatResponseTextEditPart && !part.isDone) {
+			// Track text edits; capture original once and persist on per-file completion
+			if (part instanceof ChatResponseTextEditPart) {
 				const uri = part.uri as unknown as Uri;
 				const key = uri.toString();
 				touched.set(key, uri);
-				if (!originals.has(key)) {
-					// Fire and forget; snapshot may be slightly behind live, but good enough for per-turn accounting
-					workspaceService.openTextDocumentAndSnapshot(uri as any).then(s => {
-						try { originals.set(key, s.getText()); } catch { /* ignore */ }
-					}).catch(() => {/* ignore */ });
+				if (!originals.has(key) && !originalPromises.has(key)) {
+					// Capture the 'original' snapshot as soon as we first see this file being edited
+					const p = workspaceService.openTextDocumentAndSnapshot(uri as any)
+						.then(s => {
+							const text = s.getText();
+							try { originals.set(key, text); } catch { /* ignore */ }
+							return text;
+						})
+						.catch(() => '');
+					originalPromises.set(key, p);
+				}
+
+				// When this file's edit is done, compute and persist a single-file record
+				if (part.isDone && !persisted.has(key)) {
+					// Defer actual I/O work off the event path
+					queueMicrotask(async () => {
+						try {
+							const single = await computeSingleFileDelta(uri, originals, workspaceService, diffService, originalPromises);
+							if (!single) { return; }
+							const timestamp = new Date().toISOString();
+							const record: SingleFileRecord = {
+								version: 1,
+								timestamp,
+								sessionId,
+								responseId: getResponseId(),
+								agentId,
+								command,
+								githubUsername: getGithubUsername(authService),
+								gitUrl: await getGitUrlOrWorkspacePath(workspaceService, fileSystemService),
+								vscodeVersion: envService?.getEditorInfo().version,
+								model: (await getModelName?.()) ?? undefined,
+								file: single.file,
+								language: single.language,
+								added: single.added,
+								removed: single.removed,
+							};
+
+							await writeSingleFileRecord(workspaceService, fileSystemService, record, uri);
+							persisted.add(key);
+						} catch (err) {
+							try { logService.debug(`[lineChangeRecorder] Failed to persist file edit: ${String(err)}`); } catch { }
+						}
+					});
 				}
 			}
 		},
 		async () => {
+			// No aggregated write at stream finalization. Optionally flush any files not yet persisted.
 			try {
-				const files = await computePerFileDeltas([...touched.values()], originals, workspaceService, diffService);
-				if (files.length === 0) { return; }
-
-				const totals = files.reduce((acc, f) => ({ added: acc.added + f.added, removed: acc.removed + f.removed }), { added: 0, removed: 0 });
-				const timestamp = new Date().toISOString();
-				const record: TurnRecord = {
-					version: 1,
-					timestamp,
-					sessionId,
-					responseId: getResponseId(),
-					agentId,
-					command,
-					githubUsername: getGithubUsername(authService),
-					gitUrl: await getGitUrlOrWorkspacePath(workspaceService, fileSystemService),
-					vscodeVersion: envService?.getEditorInfo().version,
-					model: (await getModelName?.()) ?? undefined,
-					totals,
-					files,
-				};
-
-				await writePerSessionRecord(workspaceService, fileSystemService, record);
+				const remaining: Uri[] = [...touched.values()].filter(u => !persisted.has(u.toString()));
+				for (const uri of remaining) {
+					const single = await computeSingleFileDelta(uri, originals, workspaceService, diffService, originalPromises);
+					if (!single) { continue; }
+					const timestamp = new Date().toISOString();
+					const record: SingleFileRecord = {
+						version: 1,
+						timestamp,
+						sessionId,
+						responseId: getResponseId(),
+						agentId,
+						command,
+						githubUsername: getGithubUsername(authService),
+						gitUrl: await getGitUrlOrWorkspacePath(workspaceService, fileSystemService),
+						vscodeVersion: envService?.getEditorInfo().version,
+						model: (await getModelName?.()) ?? undefined,
+						file: single.file,
+						language: single.language,
+						added: single.added,
+						removed: single.removed,
+					};
+					await writeSingleFileRecord(workspaceService, fileSystemService, record, uri);
+					persisted.add(uri.toString());
+				}
 			} catch (err) {
-				// Avoid surfacing errors to user; just log for diagnostics
-				try { logService.debug(`[lineChangeRecorder] Failed to persist line edits: ${String(err)}`); } catch { }
+				try { logService.debug(`[lineChangeRecorder] Finalize flush failed: ${String(err)}`); } catch { }
 			}
 		}
 	);
@@ -105,49 +152,58 @@ export function wireLineChangeRecorder(
 	return spy;
 }
 
-async function computePerFileDeltas(
-	uris: Uri[],
+// (old computePerFileDeltas removed; migrated to computeSingleFileDelta)
+
+// Compute delta for a single URI and return FileDelta or undefined if no change
+async function computeSingleFileDelta(
+	uri: Uri,
 	originals: Map<string, string>,
 	workspaceService: IWorkspaceService,
 	diffService: IDiffService,
-): Promise<FileDelta[]> {
-	const results: FileDelta[] = [];
-	for (const uri of uris) {
-		const key = uri.toString();
-		let original = originals.get(key) ?? '';
-		let modified = '';
-		try {
-			const snap = await workspaceService.openTextDocumentAndSnapshot(uri as any);
-			modified = snap.getText();
-			const displayPath = getWorkspaceFileDisplayPath(workspaceService, URI.parse(key));
-			const fileName = path.posix.basename(displayPath);
-			const language = snap.languageId ?? '';
-			const { addedLines, removedLines } = await computeAdditionsAndDeletions(diffService, original, modified);
-			results.push({ file: fileName, language, added: addedLines, removed: removedLines });
-			continue;
-		} catch {
-			continue; // skip files we can't read
+	originalPromises?: Map<string, Promise<string>>,
+): Promise<FileDelta | undefined> {
+	const key = uri.toString();
+	let original = originals.get(key);
+	if (original === undefined) {
+		const p = originalPromises?.get(key);
+		if (p) {
+			try { original = await p; } catch { original = ''; }
+		} else {
+			original = '';
 		}
 	}
-	// Filter out entries where nothing changed
-	return results.filter(r => r.added !== 0 || r.removed !== 0);
+	try {
+		// Wait for edits to be fully applied to the document before diffing
+		const { text: modified, languageId } = await getStableSnapshot(uri, workspaceService);
+		const displayPath = getWorkspaceFileDisplayPath(workspaceService, URI.parse(key));
+		const fileName = path.posix.basename(displayPath);
+		const language = languageId ?? '';
+		const { addedLines, removedLines } = await computeAdditionsAndDeletions(diffService, original ?? '', modified);
+		if (addedLines === 0 && removedLines === 0) { return undefined; }
+		return { file: fileName, language, added: addedLines, removed: removedLines };
+	} catch {
+		return undefined;
+	}
 }
 
-async function writePerSessionRecord(
+async function writeSingleFileRecord(
 	workspaceService: IWorkspaceService,
 	fileSystemService: IFileSystemService,
-	record: TurnRecord,
+	record: SingleFileRecord,
+	uri: Uri,
 ): Promise<void> {
 	const workspaceFolders = workspaceService.getWorkspaceFolders();
 	if (!workspaceFolders.length) { return; }
 	const root = workspaceFolders[0];
 	const dir = URI.joinPath(root, '.vscode');
 	const tsCompact = compactTimestamp(record.timestamp);
-	const file = URI.joinPath(dir, `lineEdits-${tsCompact}-${record.sessionId}.json`);
+	const displayPath = getWorkspaceFileDisplayPath(workspaceService, URI.parse(uri.toString()));
+	const fileBase = path.posix.basename(displayPath).replace(/[^a-zA-Z0-9._-]/g, '_');
+	const out = URI.joinPath(dir, `lineEdits-${tsCompact}-${record.sessionId}-${fileBase}.json`);
 
 	try { await fileSystemService.createDirectory(dir); } catch { /* ignore */ }
 	const payload = VSBuffer.fromString(JSON.stringify(record, undefined, 2)).buffer;
-	await fileSystemService.writeFile(file, payload);
+	await fileSystemService.writeFile(out, payload);
 }
 
 async function computeAdditionsAndDeletions(diffService: IDiffService, original: string, modified: string): Promise<{ addedLines: number; removedLines: number }> {
@@ -232,4 +288,29 @@ function parseGitRemoteUrl(configText: string): string | undefined {
 		}
 	}
 	return undefined;
+}
+
+// --- helpers ---
+
+function sleep(ms: number): Promise<void> {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Try to read a stable snapshot of a document by polling until two consecutive reads are equal or a timeout is reached
+async function getStableSnapshot(uri: Uri, workspaceService: IWorkspaceService): Promise<{ text: string; languageId?: string }> {
+	const read = async () => {
+		const snap = await workspaceService.openTextDocumentAndSnapshot(uri as any);
+		return { text: snap.getText(), languageId: snap.languageId } as const;
+	};
+	let last = await read();
+	const maxTries = 10; // ~1s with 100ms interval
+	for (let i = 0; i < maxTries; i++) {
+		await sleep(100);
+		const next = await read();
+		if (next.text === last.text) {
+			return next;
+		}
+		last = next;
+	}
+	return last;
 }
