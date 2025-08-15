@@ -10,9 +10,11 @@ import { IAuthenticationChatUpgradeService } from '../../../platform/authenticat
 import { getChatParticipantIdFromName, getChatParticipantNameFromId, workspaceAgentName } from '../../../platform/chat/common/chatAgents';
 import { CanceledMessage, ChatLocation } from '../../../platform/chat/common/commonTypes';
 import { IDiffService } from '../../../platform/diff/common/diffService';
+import { ICAPIClientService } from '../../../platform/endpoint/common/capiClient';
 import { IEndpointProvider } from '../../../platform/endpoint/common/endpointProvider';
 import { IEnvService } from '../../../platform/env/common/envService';
 import { IFileSystemService } from '../../../platform/filesystem/common/fileSystemService';
+import { IGitService } from '../../../platform/git/common/gitService';
 import { IIgnoreService } from '../../../platform/ignore/common/ignoreService';
 import { ILogService } from '../../../platform/log/common/logService';
 import { FilterReason } from '../../../platform/networking/common/openai';
@@ -153,6 +155,8 @@ export class ChatParticipantRequestHandler {
 			env,
 			auth,
 			async () => (await this._endpointProvider.getChatEndpoint(this.request)).name,
+			this._instantiationService.invokeFunction(a => a.get(IGitService)),
+			this._instantiationService.invokeFunction(a => a.get(ICAPIClientService)),
 		);
 
 		this.turn = latestTurn;
