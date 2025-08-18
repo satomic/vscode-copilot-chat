@@ -4,15 +4,14 @@
  *--------------------------------------------------------------------------------------------*/
 
 import type { AuthenticationGetSessionOptions, AuthenticationSession } from 'vscode';
-import { BaseAuthenticationService, GITHUB_SCOPE_ALIGNED, GITHUB_SCOPE_USER_EMAIL, IAuthenticationService, MinimalModeError } from '../../authentication/common/authentication';
-import { CopilotToken } from '../../authentication/common/copilotToken';
-import { ICopilotTokenManager } from '../../authentication/common/copilotTokenManager';
-import { ICopilotTokenStore } from '../../authentication/common/copilotTokenStore';
-import { getStaticGitHubToken } from '../../authentication/node/copilotTokenManager';
 import { IConfigurationService } from '../../configuration/common/configurationService';
 import { ILogService } from '../../log/common/logService';
+import { BaseAuthenticationService, GITHUB_SCOPE_ALIGNED, GITHUB_SCOPE_USER_EMAIL, IAuthenticationService, MinimalModeError } from './authentication';
+import { CopilotToken } from './copilotToken';
+import { ICopilotTokenManager } from './copilotTokenManager';
+import { ICopilotTokenStore } from './copilotTokenStore';
 
-export class TestAuthenticationService extends BaseAuthenticationService {
+export class StaticGitHubAuthenticationService extends BaseAuthenticationService {
 
 	private _githubToken: string | undefined;
 	get githubToken(): string {
@@ -25,14 +24,14 @@ export class TestAuthenticationService extends BaseAuthenticationService {
 	private readonly tokenProvider: { (): string };
 
 	constructor(
-		tokenProvider: { (): string } | undefined,
+		tokenProvider: { (): string },
 		@ILogService logService: ILogService,
 		@ICopilotTokenStore tokenStore: ICopilotTokenStore,
 		@ICopilotTokenManager tokenManager: ICopilotTokenManager,
 		@IConfigurationService configurationService: IConfigurationService
 	) {
 		super(logService, tokenStore, tokenManager, configurationService);
-		this.tokenProvider = tokenProvider || getStaticGitHubToken;
+		this.tokenProvider = tokenProvider;
 
 		const that = this;
 		this._anyGitHubSession = {
@@ -79,14 +78,19 @@ export class TestAuthenticationService extends BaseAuthenticationService {
 		this._onDidAuthenticationChange.fire();
 	}
 
+
+	override getAnyAdoSession(_options?: AuthenticationGetSessionOptions): Promise<AuthenticationSession | undefined> {
+		return Promise.resolve(undefined);
+	}
+
 	override getAdoAccessTokenBase64(options?: AuthenticationGetSessionOptions): Promise<string | undefined> {
 		return Promise.resolve(undefined);
 	}
 }
 
 export function setCopilotToken(authenticationService: IAuthenticationService, token: CopilotToken): void {
-	if (!(authenticationService instanceof TestAuthenticationService)) {
-		throw new Error('This function should only be used with TestAuthenticationService');
+	if (!(authenticationService instanceof StaticGitHubAuthenticationService)) {
+		throw new Error('This function should only be used with StaticGitHubAuthenticationService');
 	}
-	(authenticationService as TestAuthenticationService).setCopilotToken(token);
+	(authenticationService as StaticGitHubAuthenticationService).setCopilotToken(token);
 }

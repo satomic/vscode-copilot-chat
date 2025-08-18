@@ -18,6 +18,8 @@ import { ICAPIClientService } from '../../common/capiClient';
 import { IDomainService } from '../../common/domainService';
 import { IChatModelInformation } from '../../common/endpointProvider';
 import { ChatEndpoint } from '../../node/chatEndpoint';
+import { IConfigurationService } from '../../../configuration/common/configurationService';
+import { IExperimentationService } from '../../../telemetry/common/nullExperimentationService';
 
 export type IModelConfig = {
 	id: string;
@@ -79,7 +81,9 @@ export class OpenAICompatibleTestEndpoint extends ChatEndpoint {
 		@IAuthenticationService authService: IAuthenticationService,
 		@IChatMLFetcher chatMLFetcher: IChatMLFetcher,
 		@ITokenizerProvider tokenizerProvider: ITokenizerProvider,
-		@IInstantiationService private instantiationService: IInstantiationService
+		@IInstantiationService private instantiationService: IInstantiationService,
+		@IConfigurationService configurationService: IConfigurationService,
+		@IExperimentationService experimentationService: IExperimentationService
 	) {
 		const modelInfo: IChatModelInformation = {
 			id: modelConfig.id,
@@ -117,7 +121,9 @@ export class OpenAICompatibleTestEndpoint extends ChatEndpoint {
 			authService,
 			chatMLFetcher,
 			tokenizerProvider,
-			instantiationService
+			instantiationService,
+			configurationService,
+			experimentationService
 		);
 	}
 
@@ -162,6 +168,14 @@ export class OpenAICompatibleTestEndpoint extends ChatEndpoint {
 
 		if (body?.tools?.length === 0) {
 			delete body.tools;
+		}
+
+		if (body?.messages) {
+			body.messages.forEach((message: any) => {
+				if (message.copilot_cache_control) {
+					delete message.copilot_cache_control;
+				}
+			});
 		}
 
 		if (body) {

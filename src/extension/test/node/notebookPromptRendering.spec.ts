@@ -288,6 +288,8 @@ describe('Notebook Prompt Rendering', function () {
 			processResponseFromChatEndpoint: async () => { throw new Error('Method not implemented.'); },
 			acceptChatPolicy: async () => true,
 			cloneWithTokenOverride: () => endpoint,
+			createRequestBody: () => { return {}; },
+			makeChatRequest2: () => { throw new Error('Method not implemented.'); },
 			makeChatRequest: async () => { throw new Error('Method not implemented.'); },
 		};
 		const progressReporter = { report() { } };

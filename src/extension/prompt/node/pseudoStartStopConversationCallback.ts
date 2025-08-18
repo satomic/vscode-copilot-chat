@@ -62,7 +62,7 @@ export class PseudoStopStartResponseProcessor implements IResponseProcessor {
 		}
 
 		if (delta.thinking) {
-			// progress.thinking(delta.thinking);
+			progress.thinkingProgress(delta.thinking);
 			// @karthiknadig: remove this when LM API becomes available
 			this.thinkingDataService.update(0, delta.thinking);
 		}
