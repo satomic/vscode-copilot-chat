@@ -33,3 +33,8 @@ coverage/
 test/simulation/cache/_base.sqlite
 
 test/aml/out
+
+*bak*
+vsixs/
+package.json
+
