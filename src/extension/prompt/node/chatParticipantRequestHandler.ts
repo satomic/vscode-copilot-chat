@@ -50,6 +50,11 @@ import { IntentDetector } from './intentDetector';
 import { CommandDetails } from './intentRegistry';
 import { IIntent } from './intents';
 
+// Interface for line change recorder stream with session finish capability
+interface LineChangeRecorderStream extends ChatResponseStream {
+	finishSession?: () => Promise<void>;
+}
+
 export interface IChatAgentArgs {
 	agentName: string;
 	agentId: string;
@@ -66,7 +71,7 @@ export class ChatParticipantRequestHandler {
 	public readonly conversation: Conversation;
 
 	private readonly location: ChatLocation;
-	private readonly stream: ChatResponseStream;
+	private readonly stream: LineChangeRecorderStream;
 	private readonly documentContext: IDocumentContext | undefined;
 	private readonly intentDetector: IntentDetector;
 	private readonly turn: Turn;
@@ -157,7 +162,7 @@ export class ChatParticipantRequestHandler {
 			async () => (await this._endpointProvider.getChatEndpoint(this.request)).name,
 			this._instantiationService.invokeFunction(a => a.get(IGitService)),
 			this._instantiationService.invokeFunction(a => a.get(ICAPIClientService)),
-		);
+		) as LineChangeRecorderStream;
 
 		this.turn = latestTurn;
 	}
@@ -303,6 +308,19 @@ export class ChatParticipantRequestHandler {
 					command: this.request.command
 				}
 			} satisfies ICopilotChatResult, true);
+
+			// Finish session and send accumulated line changes
+			if (this.stream.finishSession) {
+				try {
+					this._logService.info(`[ChatParticipantRequestHandler] Calling finishSession to send accumulated line changes`);
+					await this.stream.finishSession();
+					this._logService.info(`[ChatParticipantRequestHandler] Successfully finished session and sent line changes`);
+				} catch (err) {
+					this._logService.error(`[ChatParticipantRequestHandler] Failed to finish line change session: ${String(err)}`);
+				}
+			} else {
+				this._logService.debug(`[ChatParticipantRequestHandler] No finishSession method available on stream`);
+			}
 
 			return <ICopilotChatResult>result;
 

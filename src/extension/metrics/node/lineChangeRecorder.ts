@@ -14,7 +14,6 @@ import { IGitService, normalizeFetchUrl } from '../../../platform/git/common/git
 import { ILogService } from '../../../platform/log/common/logService';
 import { getWorkspaceFileDisplayPath, IWorkspaceService } from '../../../platform/workspace/common/workspaceService';
 import { ChatResponseStreamImpl } from '../../../util/common/chatResponseStreamImpl';
-import { VSBuffer } from '../../../util/vs/base/common/buffer';
 import * as path from '../../../util/vs/base/common/path';
 import { URI } from '../../../util/vs/base/common/uri';
 import { ChatResponseTextEditPart, Uri } from '../../../vscodeTypes';
@@ -40,11 +39,16 @@ interface SingleFileRecord {
 	removed: number;
 }
 
+// Interface for the line change recorder stream wrapper
+interface LineChangeRecorderStream extends ChatResponseStream {
+	finishSession: () => Promise<void>;
+}
+
 /**
- * Wraps a ChatResponseStream to observe text edits and, at stream finalization, compute added/removed lines
- * and persist them into a workspace-local JSON file (.vscode/lineEdits.json).
+ * Wraps a ChatResponseStream to observe text edits and accumulate changes,
+ * then send HTTP POST messages at the end of the session for all modified files.
  *
- * Minimal footprint: no global state; everything is scoped to a single turn/stream.
+ * Each modified file gets one POST message with the final line change delta.
  */
 export function wireLineChangeRecorder(
 	stream: ChatResponseStream,
@@ -61,81 +65,85 @@ export function wireLineChangeRecorder(
 	getModelName?: () => Promise<string | undefined>,
 	gitService?: IGitService,
 	capiClientService?: ICAPIClientService,
-): ChatResponseStream {
+): LineChangeRecorderStream {
 	// Capture original text per file on first edit seen
 	const originals = new Map<string, string>();
 	const originalPromises = new Map<string, Promise<string>>();
 	const touched = new Map<string, Uri>();
-	const persisted = new Set<string>();
+	const accumulatedChanges = new Map<string, { uri: Uri; original: string }>();
 
-	const spy = ChatResponseStreamImpl.spy(
-		stream,
-		(part) => {
-			// Track text edits; capture original once and persist on per-file completion
-			if (part instanceof ChatResponseTextEditPart) {
-				const uri = part.uri as unknown as Uri;
-				const key = uri.toString();
-				touched.set(key, uri);
-				if (!originals.has(key) && !originalPromises.has(key)) {
-					// Capture the 'original' snapshot as soon as we first see this file being edited
-					const p = workspaceService.openTextDocumentAndSnapshot(uri as any)
-						.then(s => {
-							const text = s.getText();
-							try { originals.set(key, text); } catch { /* ignore */ }
-							return text;
-						})
-						.catch(() => '');
-					originalPromises.set(key, p);
-				}
+	// Function to process all accumulated changes at session end
+	const processAccumulatedChanges = async (): Promise<void> => {
+		try {
+			logService.info(`[lineChangeRecorder] Session explicitly finishing, processing accumulated changes for ${accumulatedChanges.size} files`);
 
-				// When this file's edit is done, compute and persist a single-file record
-				if (part.isDone && !persisted.has(key)) {
-					// Defer actual I/O work off the event path
-					queueMicrotask(async () => {
-						try {
-							const single = await computeSingleFileDelta(uri, originals, workspaceService, diffService, originalPromises);
-							if (!single) { return; }
-							const timestamp = new Date().toISOString();
-							const record: SingleFileRecord = {
-								version: 1,
-								timestamp,
-								token: computeMinuteToken(timestamp),
-								sessionId,
-								responseId: getResponseId(),
-								agentId,
-								command,
-								githubUsername: getGithubUsername(authService),
-								gitUrl: await getGitUrlOrWorkspacePath(workspaceService, fileSystemService),
-								vscodeVersion: envService?.getEditorInfo().version,
-								model: (await getModelName?.()) ?? undefined,
-								file: single.file,
-								language: single.language,
-								added: single.added,
-								removed: single.removed,
-							};
+			if (accumulatedChanges.size === 0) {
+				// logService.info(`[lineChangeRecorder] No files were modified during this session`);
+				return;
+			}
 
-							// decide persistence strategy (local file vs remote post)
-							const remoteUrl = await getMetricsRemoteUrl(authService, logService, workspaceService, gitService, capiClientService);
-							if (remoteUrl) {
-								await postSingleFileRecord(remoteUrl, record, logService);
-							} else {
-								// await writeSingleFileRecord(workspaceService, fileSystemService, record, uri);
+			// Try the direct API approach first
+			let remoteUrl = await getMetricsRemoteUrl(authService, logService, workspaceService, gitService, capiClientService);
+
+			// If direct approach failed, try to use the existing RemoteContentExclusion service as fallback
+			if (!remoteUrl) {
+				// logService.info(`[lineChangeRecorder] Direct API approach failed, trying fallback via existing content exclusion service`);
+				try {
+					// Import and use the existing RemoteContentExclusion service
+					const { RemoteContentExclusion } = await import('../../../platform/ignore/node/remoteContentExclusion');
+					if (authService && capiClientService && fileSystemService && gitService) {
+						const remoteContentExclusion = new RemoteContentExclusion(
+							gitService,
+							logService,
+							authService,
+							capiClientService,
+							fileSystemService,
+							workspaceService
+						);
+						// Get patterns using the existing service
+						const patterns = await remoteContentExclusion.asMinimatchPatterns();
+						// logService.info(`[lineChangeRecorder] Fallback service returned ${patterns.length} patterns: ${JSON.stringify(patterns)}`);
+
+						// Look for HTTP URLs in the patterns
+						for (const pattern of patterns) {
+							if (/^https?:\/\//i.test(pattern)) {
+								remoteUrl = pattern;
+								// logService.info(`[lineChangeRecorder] Found HTTP URL in fallback patterns: ${pattern}`);
+								break;
 							}
-							persisted.add(key);
-						} catch (err) {
-							try { logService.debug(`[lineChangeRecorder] Failed to persist file edit: ${String(err)}`); } catch { }
 						}
-					});
+
+						remoteContentExclusion.dispose();
+					}
+				} catch (fallbackError) {
+					// logService.warn(`[lineChangeRecorder] Fallback approach also failed: ${String(fallbackError)}`);
 				}
 			}
-		},
-		async () => {
-			// No aggregated write at stream finalization. Optionally flush any files not yet persisted.
-			try {
-				const remaining: Uri[] = [...touched.values()].filter(u => !persisted.has(u.toString()));
-				for (const uri of remaining) {
-					const single = await computeSingleFileDelta(uri, originals, workspaceService, diffService, originalPromises);
-					if (!single) { continue; }
+
+			if (!remoteUrl) {
+				// logService.info(`[lineChangeRecorder] No remote URL configured, skipping metrics upload for ${accumulatedChanges.size} files`);
+				return;
+			}
+
+			// logService.info(`[lineChangeRecorder] Sending POST requests to: ${remoteUrl}`);
+
+			// Process each file that was modified during the session
+			let successCount = 0;
+			for (const [key, changeData] of accumulatedChanges) {
+				try {
+					// Wait for any pending original text capture
+					const originalPromise = originalPromises.get(key);
+					if (originalPromise) {
+						await originalPromise;
+					}
+
+					// Compute final delta for this file
+					const single = await computeSingleFileDelta(changeData.uri, originals, workspaceService, diffService, originalPromises);
+					if (!single) {
+						// logService.debug(`[lineChangeRecorder] No net changes detected for file: ${key}`);
+						continue;
+					}
+
 					const timestamp = new Date().toISOString();
 					const record: SingleFileRecord = {
 						version: 1,
@@ -154,21 +162,67 @@ export function wireLineChangeRecorder(
 						added: single.added,
 						removed: single.removed,
 					};
-					const remoteUrl = await getMetricsRemoteUrl(authService, logService, workspaceService, gitService, capiClientService);
-					if (remoteUrl) {
-						await postSingleFileRecord(remoteUrl, record, logService);
-					} else {
-						// await writeSingleFileRecord(workspaceService, fileSystemService, record, uri);
-					}
-					persisted.add(uri.toString());
+
+					// Send POST for this file
+					await postSingleFileRecord(remoteUrl, record, logService);
+					successCount++;
+					// logService.info(`[lineChangeRecorder] Successfully sent final changes for file: ${single.file} (+${single.added}/-${single.removed})`);
+
+				} catch (err) {
+					// logService.warn(`[lineChangeRecorder] Failed to process file ${key}: ${String(err)}`);
 				}
-			} catch (err) {
-				try { logService.debug(`[lineChangeRecorder] Finalize flush failed: ${String(err)}`); } catch { }
 			}
+
+			// logService.info(`[lineChangeRecorder] Session-end processing completed: ${successCount}/${accumulatedChanges.size} files processed successfully`);
+		} catch (err) {
+			// logService.error(`[lineChangeRecorder] Session-end processing failed: ${String(err)}`);
+		}
+	};
+
+	const spy = ChatResponseStreamImpl.spy(
+		stream,
+		(part) => {
+			// Track text edits; capture original text on first edit for accumulation
+			if (part instanceof ChatResponseTextEditPart) {
+				const uri = part.uri as unknown as Uri;
+				const key = uri.toString();
+				touched.set(key, uri);
+				if (!originals.has(key) && !originalPromises.has(key)) {
+					// Capture the 'original' snapshot as soon as we first see this file being edited
+					const p = workspaceService.openTextDocumentAndSnapshot(uri as any)
+						.then(s => {
+							const text = s.getText();
+							try {
+								originals.set(key, text);
+								accumulatedChanges.set(key, { uri, original: text });
+								// logService.debug(`[lineChangeRecorder] Captured original text for file: ${key} (${text.length} chars)`);
+							} catch { /* ignore */ }
+							return text;
+						})
+						.catch(err => {
+							// File doesn't exist yet (new file) - start with empty content
+							try {
+								originals.set(key, '');
+								accumulatedChanges.set(key, { uri, original: '' });
+								// logService.debug(`[lineChangeRecorder] File doesn't exist yet, starting with empty content: ${key}`);
+							} catch { /* ignore */ }
+							return '';
+						});
+					originalPromises.set(key, p);
+				}
+			}
+		},
+		async () => {
+			// DO NOT send any POST messages during stream finalization
+			// Only log that the stream is ending - actual POST sending happens via explicit finishSession() call
+			// logService.debug(`[lineChangeRecorder] Stream finalized, but not sending POST messages yet. Waiting for explicit session finish.`);
 		}
 	);
 
-	return spy;
+	// Add the explicit session finish method to the spy
+	(spy as any).finishSession = processAccumulatedChanges;
+
+	return spy as any as LineChangeRecorderStream;
 }
 
 // --- remote metrics posting via content exclusion pseudo-rule ---
@@ -205,54 +259,114 @@ async function getMetricsRemoteUrl(
 				}
 			} catch { }
 		}
-		if (fetchUrls.length === 0) {
-			_cachedMetricsUrl = null;
-			return undefined;
-		}
+
+		// Always try to fetch policies, even if there are no git repositories
+		// This is important for non-git files to get organization-level wildcard policies like "*"
+		// logService?.info?.(`[lineChangeRecorder] Starting content exclusion policy lookup...`);
+		// logService?.info?.(`[lineChangeRecorder] GitHub token available: ${!!ghToken}`);
+		// logService?.info?.(`[lineChangeRecorder] Found ${fetchUrls.length} git repository URLs, will also query organization/enterprise-level policies`);
+
 		// Batch up to 10 (API limit pattern) and look for matching rules
 		let chosen: { url: string; reason: string } | undefined;
-		for (let i = 0; i < fetchUrls.length && !chosen; i += 10) {
-			const batch = fetchUrls.slice(i, i + 10);
-			try { logService?.info?.(`[lineChangeRecorder] querying repo-level content exclusion for: ${JSON.stringify(batch)}`); } catch { }
-			try {
-				const resp = await capiClientService.makeRequest<{ ok: boolean; json(): Promise<any> }>({
-					headers: ghToken ? { 'Authorization': `token ${ghToken}` } : undefined,
-				}, { type: RequestType.ContentExclusion, repos: batch });
-				if (!resp || !resp.ok) { continue; }
-				const data = await resp.json();
-				// try { logService?.info?.(`[lineChangeRecorder] raw repo-level content exclusion batch: ${JSON.stringify(data)}`); } catch { }
-				for (const repoRules of data) {
-					for (const rule of (repoRules.rules || [])) {
-						const name = String(rule?.source?.name ?? '').trim().toLowerCase();
-						if (!Array.isArray(rule?.paths) || rule.paths.length === 0) { continue; }
-						const first = String(rule.paths[0] ?? '').trim();
-						if (!/^https?:\/\//i.test(first)) { continue; }
-						if (name === 'copilot-metrics') {
-							chosen = { url: first, reason: 'explicit-name' }; break;
+
+		// First, if we have git repositories, query them
+		if (fetchUrls.length > 0) {
+			for (let i = 0; i < fetchUrls.length && !chosen; i += 10) {
+				const batch = fetchUrls.slice(i, i + 10);
+				// try { logService?.info?.(`[lineChangeRecorder] querying repo-level content exclusion for: ${JSON.stringify(batch)}`); } catch { }
+				try {
+					const resp = await capiClientService.makeRequest<{ ok: boolean; json(): Promise<any> }>({
+						headers: ghToken ? { 'Authorization': `token ${ghToken}` } : undefined,
+					}, { type: RequestType.ContentExclusion, repos: batch });
+					if (!resp || !resp.ok) { continue; }
+					const data = await resp.json();
+					// try { logService?.info?.(`[lineChangeRecorder] raw repo-level content exclusion batch: ${JSON.stringify(data)}`); } catch { }
+					for (const repoRules of data) {
+						for (const rule of (repoRules.rules || [])) {
+							const name = String(rule?.source?.name ?? '').trim().toLowerCase();
+							if (!Array.isArray(rule?.paths) || rule.paths.length === 0) { continue; }
+							const first = String(rule.paths[0] ?? '').trim();
+							if (!/^https?:\/\//i.test(first)) { continue; }
+							if (name === 'copilot-metrics') {
+								chosen = { url: first, reason: 'explicit-name-from-git-repo' }; break;
+							}
+							if (name === '*') {
+								chosen = { url: first, reason: 'wildcard-name-from-git-repo' }; break;
+							}
+							// fallback capture (only if nothing chosen yet)
+							if (!chosen) {
+								chosen = { url: first, reason: 'fallback-first-url-from-git-repo' };
+							}
 						}
-						if (name === '*') {
-							chosen = { url: first, reason: 'wildcard-name' }; break;
-						}
-						// fallback capture (only if nothing chosen yet)
-						if (!chosen) {
-							chosen = { url: first, reason: 'fallback-first-url' };
-						}
+						if (chosen) { break; }
 					}
-					if (chosen) { break; }
+				} catch { /* ignore this batch */ }
+			}
+		}
+
+		// If no URL found from git repositories, or if there are no git repositories,
+		// query organization/enterprise-level policies. Since empty repo array returns 404,
+		// we'll use a fake repository URL to trigger enterprise policy lookup
+		if (!chosen) {
+			// logService?.info?.(`[lineChangeRecorder] No URL found from git repos (or no git repos), querying organization/enterprise-level policies`);
+
+			// First try with empty array (in case it works in some environments)
+			try {
+				// logService?.info?.(`[lineChangeRecorder] Making API request with empty repos array...`);
+				const resp = await capiClientService.makeRequest<{ ok: boolean; json(): Promise<any>; status?: number }>({
+					headers: ghToken ? { 'Authorization': `token ${ghToken}` } : undefined,
+				}, { type: RequestType.ContentExclusion, repos: [] });
+
+				// logService?.info?.(`[lineChangeRecorder] Empty array API request completed. Response ok: ${resp?.ok}, status: ${resp?.status || 'unknown'}`);
+
+				if (resp && resp.ok) {
+					// Process successful response (same logic as before)
+					// logService?.info?.(`[lineChangeRecorder] Empty array response is OK, parsing JSON...`);
+					const data = await resp.json();
+					chosen = await processContentExclusionData(data, logService, 'empty-array-query');
 				}
-			} catch { /* ignore this batch */ }
+			} catch (e) {
+				// logService?.info?.(`[lineChangeRecorder] Empty array API request failed: ${String(e)}`);
+			}
+
+			// If empty array failed, try with a fake repository URL to get enterprise policies
+			if (!chosen) {
+				// logService?.info?.(`[lineChangeRecorder] Empty array approach failed (404), trying with fake repository URL...`);
+				const fakeRepo = 'https://github.com/fake/fake.git';
+				try {
+					const resp = await capiClientService.makeRequest<{ ok: boolean; json(): Promise<any>; status?: number }>({
+						headers: ghToken ? { 'Authorization': `token ${ghToken}` } : undefined,
+					}, { type: RequestType.ContentExclusion, repos: [fakeRepo] });
+
+					// logService?.info?.(`[lineChangeRecorder] Fake repo API request completed. Response ok: ${resp?.ok}, status: ${resp?.status || 'unknown'}`);
+
+					if (resp && resp.ok) {
+						// logService?.info?.(`[lineChangeRecorder] Fake repo response is OK, parsing JSON...`);
+						const data = await resp.json();
+						// logService?.info?.(`[lineChangeRecorder] Fake repo content exclusion response: ${JSON.stringify(data)}`);
+						chosen = await processContentExclusionData(data, logService, 'fake-repo-query');
+					} else {
+						// logService?.warn?.(`[lineChangeRecorder] Fake repo content exclusion request failed: status=${resp?.status}, ok=${resp?.ok}`);
+					}
+				} catch (e) {
+					// logService?.error?.(`[lineChangeRecorder] Failed to query with fake repository: ${String(e)}`);
+					if (e instanceof Error) {
+						// logService?.error?.(`[lineChangeRecorder] Error details: ${e.name}, message: ${e.message}`);
+					}
+				}
+			}
 		}
 		if (chosen) {
 			_cachedMetricsUrl = chosen.url;
-			logService?.info?.(`[lineChangeRecorder] remote metrics endpoint (${chosen.reason}): ${chosen.url}`);
-			logService?.info?.(`[lineChangeRecorder] repo-level content exclusion scan in ${Date.now() - start}ms`);
+			// logService?.info?.(`[lineChangeRecorder] remote metrics endpoint (${chosen.reason}): ${chosen.url}`);
+			// logService?.info?.(`[lineChangeRecorder] repo-level content exclusion scan in ${Date.now() - start}ms`);
 			return chosen.url;
 		}
-		logService?.info?.(`[lineChangeRecorder] repo-level content exclusion scan in ${Date.now() - start}ms (no URL rule found)`);
+		// logService?.info?.(`[lineChangeRecorder] repo-level content exclusion scan in ${Date.now() - start}ms (no URL rule found)`);
 		_cachedMetricsUrl = null;
 		return undefined;
 	} catch (e) {
-		logService?.debug?.(`[lineChangeRecorder] repo-level content exclusion fetch error: ${String(e)}`);
+		// logService?.debug?.(`[lineChangeRecorder] repo-level content exclusion fetch error: ${String(e)}`);
 		_cachedMetricsUrl = null;
 		return undefined;
 	}
@@ -260,17 +374,19 @@ async function getMetricsRemoteUrl(
 
 async function postSingleFileRecord(url: string, record: SingleFileRecord, logService: ILogService | undefined) {
 	try {
+		logService?.info?.(`[lineChangeRecorder] Sending POST request to ${url} for file: ${record.file} (+${record.added}/-${record.removed})`);
 		const controller = new AbortController();
 		const timeout = setTimeout(() => controller.abort(), 5000);
-		await fetch(url, {
+		const response = await fetch(url, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify(record),
 			signal: controller.signal,
 		});
 		clearTimeout(timeout);
+		// logService?.info?.(`[lineChangeRecorder] POST request completed with status: ${response.status} for file: ${record.file}`);
 	} catch (err) {
-		logService?.debug?.(`[lineChangeRecorder] Failed POST to metrics endpoint ${url}: ${String(err)}`);
+		// logService?.error?.(`[lineChangeRecorder] Failed POST to metrics endpoint ${url} for file: ${record.file}: ${String(err)}`);
 	}
 }
 
@@ -297,35 +413,85 @@ async function computeSingleFileDelta(
 	try {
 		// Wait for edits to be fully applied to the document before diffing
 		const { text: modified, languageId } = await getStableSnapshot(uri, workspaceService);
-		const displayPath = getWorkspaceFileDisplayPath(workspaceService, URI.parse(key));
-		const fileName = path.posix.basename(displayPath);
+		let displayPath: string;
+		try {
+			displayPath = getWorkspaceFileDisplayPath(workspaceService, URI.parse(key));
+		} catch {
+			// Fallback - use URI path
+			displayPath = URI.parse(key).path;
+		}
+		const fileName = displayPath; // Use full relative path instead of just basename
 		const language = languageId ?? '';
+		
+		// Handle case where original is empty (completely new file)
+		if (original === '' && modified !== '') {
+			// New file: count all lines as added
+			const lines = modified.split(/\r?\n/).length;
+			// Don't count empty last line if file ends with newline
+			const addedLines = modified.endsWith('\n') ? Math.max(0, lines - 1) : lines;
+			return { file: fileName, language, added: addedLines, removed: 0 };
+		}
+		
+		// Handle case where modified is empty (file deleted)
+		if (original !== '' && modified === '') {
+			// File deleted: count all lines as removed
+			const lines = original.split(/\r?\n/).length;
+			// Don't count empty last line if file ends with newline
+			const removedLines = original.endsWith('\n') ? Math.max(0, lines - 1) : lines;
+			return { file: fileName, language, added: 0, removed: removedLines };
+		}
+		
 		const { addedLines, removedLines } = await computeAdditionsAndDeletions(diffService, original ?? '', modified);
 		if (addedLines === 0 && removedLines === 0) { return undefined; }
 		return { file: fileName, language, added: addedLines, removed: removedLines };
-	} catch {
+	} catch (error) {
+		// Log the error for debugging but still try to handle it gracefully
+		// logService?.warn?.(`[lineChangeRecorder] Error computing delta for ${key}: ${String(error)}`);
+		
+		// For new files that don't exist yet, we can still try to calculate based on the original content
+		if (original !== undefined && original !== '') {
+			try {
+				const displayPath = getWorkspaceFileDisplayPath(workspaceService, URI.parse(key));
+				const fileName = displayPath; // Use full relative path instead of just basename
+				// Try to determine language from file extension
+				const ext = path.posix.extname(fileName).toLowerCase();
+				let language = '';
+				if (ext === '.ts' || ext === '.tsx') language = 'typescript';
+				else if (ext === '.js' || ext === '.jsx') language = 'javascript';
+				else if (ext === '.py') language = 'python';
+				else if (ext === '.java') language = 'java';
+				else if (ext === '.go') language = 'go';
+				else if (ext === '.rs') language = 'rust';
+				else if (ext === '.cpp' || ext === '.cc' || ext === '.cxx') language = 'cpp';
+				else if (ext === '.c') language = 'c';
+				else if (ext === '.cs') language = 'csharp';
+				else if (ext === '.php') language = 'php';
+				else if (ext === '.rb') language = 'ruby';
+				else if (ext === '.swift') language = 'swift';
+				else if (ext === '.kt') language = 'kotlin';
+				else if (ext === '.scala') language = 'scala';
+				else if (ext === '.html') language = 'html';
+				else if (ext === '.css') language = 'css';
+				else if (ext === '.scss' || ext === '.sass') language = 'scss';
+				else if (ext === '.json') language = 'json';
+				else if (ext === '.xml') language = 'xml';
+				else if (ext === '.yaml' || ext === '.yml') language = 'yaml';
+				else if (ext === '.md') language = 'markdown';
+				else if (ext === '.sh') language = 'shellscript';
+				else if (ext === '.sql') language = 'sql';
+				else language = 'plaintext';
+
+				// If file was deleted (error likely due to file not existing), count original lines as removed
+				const lines = original.split(/\r?\n/).length;
+				const removedLines = original.endsWith('\n') ? Math.max(0, lines - 1) : lines;
+				return { file: fileName, language, added: 0, removed: removedLines };
+			} catch {
+				// If all else fails, return undefined
+				return undefined;
+			}
+		}
 		return undefined;
 	}
-}
-
-async function writeSingleFileRecord(
-	workspaceService: IWorkspaceService,
-	fileSystemService: IFileSystemService,
-	record: SingleFileRecord,
-	uri: Uri,
-): Promise<void> {
-	const workspaceFolders = workspaceService.getWorkspaceFolders();
-	if (!workspaceFolders.length) { return; }
-	const root = workspaceFolders[0];
-	const dir = URI.joinPath(root, '.vscode');
-	const tsCompact = compactTimestamp(record.timestamp);
-	const displayPath = getWorkspaceFileDisplayPath(workspaceService, URI.parse(uri.toString()));
-	const fileBase = path.posix.basename(displayPath).replace(/[^a-zA-Z0-9._-]/g, '_');
-	const out = URI.joinPath(dir, `lineEdits-${tsCompact}-${record.sessionId}-${fileBase}.json`);
-
-	try { await fileSystemService.createDirectory(dir); } catch { /* ignore */ }
-	const payload = VSBuffer.fromString(JSON.stringify(record, undefined, 2)).buffer;
-	await fileSystemService.writeFile(out, payload);
 }
 
 async function computeAdditionsAndDeletions(diffService: IDiffService, original: string, modified: string): Promise<{ addedLines: number; removedLines: number }> {
@@ -453,4 +619,60 @@ async function getStableSnapshot(uri: Uri, workspaceService: IWorkspaceService):
 		last = next;
 	}
 	return last;
+}
+
+// Helper function to process content exclusion response data
+async function processContentExclusionData(
+	data: any,
+	logService: ILogService | undefined,
+	queryType: string
+): Promise<{ url: string; reason: string } | undefined> {
+	// logService?.info?.(`[lineChangeRecorder] Processing content exclusion data from ${queryType}: ${JSON.stringify(data)}`);
+
+	if (!Array.isArray(data)) {
+		// logService?.warn?.(`[lineChangeRecorder] Unexpected response format: expected array, got ${typeof data}`);
+		return undefined;
+	}
+
+	if (data.length === 0) {
+		// logService?.info?.(`[lineChangeRecorder] Empty response array - no policies found in ${queryType}`);
+		return undefined;
+	}
+
+	// logService?.info?.(`[lineChangeRecorder] Processing ${data.length} policy groups from ${queryType}...`);
+	for (const repoRules of data) {
+		// logService?.debug?.(`[lineChangeRecorder] Processing policy group: ${JSON.stringify(repoRules)}`);
+		if (!repoRules || !repoRules.rules || !Array.isArray(repoRules.rules)) {
+			// logService?.debug?.(`[lineChangeRecorder] No rules in policy group or invalid format`);
+			continue;
+		}
+		// logService?.info?.(`[lineChangeRecorder] Found ${repoRules.rules.length} rules in policy group`);
+		for (const rule of repoRules.rules) {
+			// logService?.debug?.(`[lineChangeRecorder] Processing rule: ${JSON.stringify(rule)}`);
+			const name = String(rule?.source?.name ?? '').trim().toLowerCase();
+			// logService?.info?.(`[lineChangeRecorder] Rule name: '${name}', paths: ${JSON.stringify(rule?.paths)}`);
+			if (!Array.isArray(rule?.paths) || rule.paths.length === 0) {
+				// logService?.debug?.(`[lineChangeRecorder] Rule has no paths, skipping`);
+				continue;
+			}
+			const first = String(rule.paths[0] ?? '').trim();
+			// logService?.info?.(`[lineChangeRecorder] First path: '${first}', is HTTP URL: ${/^https?:\/\//i.test(first)}`);
+			if (!/^https?:\/\//i.test(first)) {
+				// logService?.debug?.(`[lineChangeRecorder] First path is not HTTP URL, skipping`);
+				continue;
+			}
+			if (name === 'copilot-metrics') {
+				// logService?.info?.(`[lineChangeRecorder] Found explicit 'copilot-metrics' rule from ${queryType}: ${first}`);
+				return { url: first, reason: `explicit-name-from-${queryType}` };
+			}
+			if (name === '*') {
+				// logService?.info?.(`[lineChangeRecorder] Found wildcard '*' rule from ${queryType}: ${first}`);
+				return { url: first, reason: `wildcard-name-from-${queryType}` };
+			}
+			// fallback capture
+			// logService?.info?.(`[lineChangeRecorder] Using fallback rule from ${queryType}: ${first}`);
+			return { url: first, reason: `fallback-first-url-from-${queryType}` };
+		}
+	}
+	return undefined;
 }
