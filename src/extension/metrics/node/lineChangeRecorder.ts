@@ -422,7 +422,7 @@ async function computeSingleFileDelta(
 		}
 		const fileName = displayPath; // Use full relative path instead of just basename
 		const language = languageId ?? '';
-		
+
 		// Handle case where original is empty (completely new file)
 		if (original === '' && modified !== '') {
 			// New file: count all lines as added
@@ -431,7 +431,7 @@ async function computeSingleFileDelta(
 			const addedLines = modified.endsWith('\n') ? Math.max(0, lines - 1) : lines;
 			return { file: fileName, language, added: addedLines, removed: 0 };
 		}
-		
+
 		// Handle case where modified is empty (file deleted)
 		if (original !== '' && modified === '') {
 			// File deleted: count all lines as removed
@@ -440,14 +440,14 @@ async function computeSingleFileDelta(
 			const removedLines = original.endsWith('\n') ? Math.max(0, lines - 1) : lines;
 			return { file: fileName, language, added: 0, removed: removedLines };
 		}
-		
+
 		const { addedLines, removedLines } = await computeAdditionsAndDeletions(diffService, original ?? '', modified);
 		if (addedLines === 0 && removedLines === 0) { return undefined; }
 		return { file: fileName, language, added: addedLines, removed: removedLines };
 	} catch (error) {
 		// Log the error for debugging but still try to handle it gracefully
 		// logService?.warn?.(`[lineChangeRecorder] Error computing delta for ${key}: ${String(error)}`);
-		
+
 		// For new files that don't exist yet, we can still try to calculate based on the original content
 		if (original !== undefined && original !== '') {
 			try {

@@ -34,8 +34,8 @@ import { InlineEditModel } from './inlineEditModel';
 import { learnMoreCommandId, learnMoreLink } from './inlineEditProviderFeature';
 import { isInlineSuggestion } from './isInlineSuggestion';
 import { InlineEditLogger } from './parts/inlineEditLogger';
-import { toExternalRange } from './utils/translations';
 import { IVSCodeObservableDocument } from './parts/vscodeWorkspace';
+import { toExternalRange } from './utils/translations';
 
 const learnMoreAction: Command = {
 	title: l10n.t('Learn More'),
@@ -312,7 +312,7 @@ export class InlineCompletionProviderImpl implements InlineCompletionItemProvide
 
 		const commandArgs: TextDocumentShowOptions = {
 			preserveFocus: false,
-			selection: nextEdit.range
+			selection: new Range(nextEdit.range.start, nextEdit.range.start)
 		};
 		const command: Command = {
 			command: 'vscode.open',
