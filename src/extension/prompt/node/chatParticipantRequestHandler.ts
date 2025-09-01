@@ -5,10 +5,16 @@
 
 import * as l10n from '@vscode/l10n';
 import type { ChatRequest, ChatRequestTurn2, ChatResponseStream, ChatResult, Location } from 'vscode';
+import { IAuthenticationService } from '../../../platform/authentication/common/authentication';
 import { IAuthenticationChatUpgradeService } from '../../../platform/authentication/common/authenticationUpgrade';
 import { getChatParticipantIdFromName, getChatParticipantNameFromId, workspaceAgentName } from '../../../platform/chat/common/chatAgents';
 import { CanceledMessage, ChatLocation } from '../../../platform/chat/common/commonTypes';
+import { IDiffService } from '../../../platform/diff/common/diffService';
+import { ICAPIClientService } from '../../../platform/endpoint/common/capiClient';
 import { IEndpointProvider } from '../../../platform/endpoint/common/endpointProvider';
+import { IEnvService } from '../../../platform/env/common/envService';
+import { IFileSystemService } from '../../../platform/filesystem/common/fileSystemService';
+import { IGitService } from '../../../platform/git/common/gitService';
 import { IIgnoreService } from '../../../platform/ignore/common/ignoreService';
 import { ILogService } from '../../../platform/log/common/logService';
 import { FilterReason } from '../../../platform/networking/common/openai';
@@ -32,6 +38,7 @@ import { getAgentForIntent, Intent } from '../../common/constants';
 import { IConversationStore } from '../../conversationStore/node/conversationStore';
 import { IIntentService } from '../../intents/node/intentService';
 import { UnknownIntent } from '../../intents/node/unknownIntent';
+import { wireLineChangeRecorder } from '../../metrics/node/lineChangeRecorder';
 import { ContributedToolName } from '../../tools/common/toolNames';
 import { ChatVariablesCollection } from '../common/chatVariablesCollection';
 import { Conversation, GlobalContextMessageMetadata, ICopilotChatResult, ICopilotChatResultIn, normalizeSummariesOnRounds, RenderedUserMessageMetadata, Turn, TurnStatus } from '../common/conversation';
@@ -42,6 +49,12 @@ import { IDocumentContext } from './documentContext';
 import { IntentDetector } from './intentDetector';
 import { CommandDetails } from './intentRegistry';
 import { IIntent } from './intents';
+
+
+// Interface for line change recorder stream with session finish capability
+interface LineChangeRecorderStream extends ChatResponseStream {
+	finishSession?: () => Promise<void>;
+}
 
 export interface IChatAgentArgs {
 	agentName: string;
@@ -59,7 +72,8 @@ export class ChatParticipantRequestHandler {
 	public readonly conversation: Conversation;
 
 	private readonly location: ChatLocation;
-	private readonly stream: ChatResponseStream;
+	private readonly stream: LineChangeRecorderStream;
+	// private readonly stream: ChatResponseStream;
 	private readonly documentContext: IDocumentContext | undefined;
 	private readonly intentDetector: IntentDetector;
 	private readonly turn: Turn;
@@ -87,6 +101,7 @@ export class ChatParticipantRequestHandler {
 
 		this.intentDetector = this._instantiationService.createInstance(IntentDetector);
 
+		// Start with the raw stream; wrap with filters/recorders after sessionId is known
 		this.stream = stream;
 
 		if (request.location2 instanceof ChatRequestEditorData) {
@@ -96,7 +111,7 @@ export class ChatParticipantRequestHandler {
 
 			const documentUri = request.location2.document.uri;
 
-			this.stream = ChatResponseStreamImpl.filter(stream, part => {
+			this.stream = ChatResponseStreamImpl.filter(this.stream, part => {
 				if (part instanceof ChatResponseReferencePart || part instanceof ChatResponseProgressPart2) {
 					const uri = URI.isUri(part.value) ? part.value : (<Location>part.value).uri;
 					return !isEqual(uri, documentUri);
@@ -128,6 +143,28 @@ export class ChatParticipantRequestHandler {
 		);
 
 		this.conversation = new Conversation(actualSessionId, turns.concat(latestTurn));
+
+		// Now that sessionId is known, wrap stream with the line change recorder
+		const fs = this._instantiationService.invokeFunction(accessor => accessor.get(IFileSystemService));
+		const diff = this._instantiationService.invokeFunction(accessor => accessor.get(IDiffService));
+		const env = this._instantiationService.invokeFunction(accessor => accessor.get(IEnvService));
+		const auth = this._instantiationService.invokeFunction(accessor => accessor.get(IAuthenticationService));
+		this.stream = wireLineChangeRecorder(
+			this.stream,
+			this._instantiationService.invokeFunction(a => a.get(IWorkspaceService)),
+			fs,
+			diff,
+			this._instantiationService.invokeFunction(a => a.get(ILogService)),
+			actualSessionId,
+			() => this.turn?.id ?? '',
+			this.chatAgentArgs.agentId,
+			this.request.command,
+			env,
+			auth,
+			async () => (await this._endpointProvider.getChatEndpoint(this.request)).name,
+			this._instantiationService.invokeFunction(a => a.get(IGitService)),
+			this._instantiationService.invokeFunction(a => a.get(ICAPIClientService)),
+		) as LineChangeRecorderStream;
 
 		this.turn = latestTurn;
 	}
@@ -273,6 +310,19 @@ export class ChatParticipantRequestHandler {
 					command: this.request.command
 				}
 			} satisfies ICopilotChatResult, true);
+
+			// Finish session and send accumulated line changes
+			if (this.stream.finishSession) {
+				try {
+					this._logService.info(`[ChatParticipantRequestHandler] Calling finishSession to send accumulated line changes`);
+					await this.stream.finishSession();
+					this._logService.info(`[ChatParticipantRequestHandler] Successfully finished session and sent line changes`);
+				} catch (err) {
+					this._logService.error(`[ChatParticipantRequestHandler] Failed to finish line change session: ${String(err)}`);
+				}
+			} else {
+				this._logService.debug(`[ChatParticipantRequestHandler] No finishSession method available on stream`);
+			}
 
 			return <ICopilotChatResult>result;
 

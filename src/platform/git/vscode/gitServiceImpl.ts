@@ -150,13 +150,21 @@ export class GitServiceImpl extends Disposable implements IGitService {
 		}
 
 		try {
-			const uriStat = await vscode.workspace.fs.stat(uri);
-			if (uriStat.type !== vscode.FileType.Directory) {
-				uri = URI.file(path.dirname(uri.fsPath));
+			// Check if the file exists first to handle new files gracefully
+			let actualUri = uri;
+			try {
+				const uriStat = await vscode.workspace.fs.stat(uri);
+				if (uriStat.type !== vscode.FileType.Directory) {
+					actualUri = URI.file(path.dirname(uri.fsPath));
+				}
+			} catch (statError) {
+				// File doesn't exist (new file case), use parent directory
+				actualUri = URI.file(path.dirname(uri.fsPath));
+				this.logService.trace(`[GitServiceImpl][getRepositoryFetchUrls] File doesn't exist, using parent directory: ${actualUri.toString()}`);
 			}
 
 			// Get repository root
-			const repositoryRoot = await gitAPI.getRepositoryRoot(uri);
+			const repositoryRoot = await gitAPI.getRepositoryRoot(actualUri);
 			if (!repositoryRoot) {
 				this.logService.trace(`[GitServiceImpl][getRepositoryFetchUrls] No repository root found`);
 				return undefined;
