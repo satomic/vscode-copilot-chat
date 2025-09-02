@@ -4,9 +4,9 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { readFile } from 'fs/promises';
-import * as os from 'os';
 import * as path from 'path';
 import { beforeEach, describe, expect, it } from 'vitest';
+import { INativeEnvService } from '../../../../../platform/env/common/envService';
 import { IFileSystemService } from '../../../../../platform/filesystem/common/fileSystemService';
 import { FileType } from '../../../../../platform/filesystem/common/fileTypes';
 import { MockFileSystemService } from '../../../../../platform/filesystem/node/test/mockFileSystemService';
@@ -17,6 +17,7 @@ import { URI } from '../../../../../util/vs/base/common/uri';
 import { IInstantiationService } from '../../../../../util/vs/platform/instantiation/common/instantiation';
 import { createExtensionUnitTestingServices } from '../../../../test/node/services';
 import { ClaudeCodeSessionService } from '../claudeCodeSessionService';
+import { TestingServiceCollection } from '../../../../../platform/test/node/services';
 
 function computeFolderSlug(folderUri: URI): string {
 	return folderUri.path.replace(/\//g, '-');
@@ -26,17 +27,16 @@ describe('ClaudeCodeSessionService', () => {
 	const workspaceFolderPath = '/project';
 	const folderUri = URI.file(workspaceFolderPath);
 	const slug = computeFolderSlug(folderUri);
-	const home = os.homedir();
-	const dirUri = URI.joinPath(URI.file(home), '.claude', 'projects', slug);
+	let dirUri: URI;
 
 	let mockFs: MockFileSystemService;
-	let testingServiceCollection: ReturnType<typeof createExtensionUnitTestingServices>;
+	let testingServiceCollection: TestingServiceCollection;
 	let service: ClaudeCodeSessionService;
 
 	beforeEach(() => {
 		mockFs = new MockFileSystemService();
 		testingServiceCollection = createExtensionUnitTestingServices();
-		testingServiceCollection.set(IFileSystemService, mockFs as any);
+		testingServiceCollection.set(IFileSystemService, mockFs);
 
 		// Create mock workspace service with the test workspace folder
 		const workspaceService = new TestWorkspaceService([folderUri]);
@@ -44,6 +44,8 @@ describe('ClaudeCodeSessionService', () => {
 
 		const accessor = testingServiceCollection.createTestingAccessor();
 		const instaService = accessor.get(IInstantiationService);
+		const nativeEnvService = accessor.get(INativeEnvService);
+		dirUri = URI.joinPath(nativeEnvService.userHome, '.claude', 'projects', slug);
 		service = instaService.createInstance(ClaudeCodeSessionService);
 	});
 
@@ -77,7 +79,15 @@ describe('ClaudeCodeSessionService', () => {
 
 		expect(sessions.map(s => ({
 			id: s.id,
-			messages: `${s.messages.length} messages`,
+			messages: s.messages.map(m => {
+				if (m.type === 'user' || m.type === 'assistant') {
+					if (typeof m.message.content === 'string') {
+						return m.message.content;
+					} else {
+						return m.message.content.map(c => c.type === 'text' ? c.text : `<${c.type}>`).join('');
+					}
+				}
+			}),
 			label: s.label,
 			timestamp: s.timestamp.toISOString()
 		}))).toMatchInlineSnapshot(`
@@ -85,13 +95,23 @@ describe('ClaudeCodeSessionService', () => {
 			  {
 			    "id": "553dd2b5-8a53-4fbf-9db2-240632522fe5",
 			    "label": "hello session 2",
-			    "messages": "2 messages",
+			    "messages": [
+			      "hello session 2",
+			      "Hello! I'm ready to help you with your coding tasks in the vscode-copilot-chat project.",
+			    ],
 			    "timestamp": "2025-08-29T21:42:37.329Z",
 			  },
 			  {
 			    "id": "b02ed4d8-1f00-45cc-949f-3ea63b2dbde2",
 			    "label": "VS Code Copilot Chat: Initial Project Setup",
-			    "messages": "6 messages",
+			    "messages": [
+			      "hello session 1",
+			      "Hello! How can I help you with your VS Code Copilot Chat project today?",
+			      "hello session 1 continued",
+			      "Hi! I'm ready to continue helping with your VS Code Copilot Chat project. What would you like to work on?",
+			      "hello session 1 resumed",
+			      "Hello! I see you have the \`claudeCodeSessionLoader.ts\` file open. How can I help you with your VS Code Copilot Chat project?",
+			    ],
 			    "timestamp": "2025-08-29T21:42:28.431Z",
 			  },
 			]
